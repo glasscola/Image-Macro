@@ -216,9 +216,9 @@ def small_size_candidates(screen,model,threshold,check):
 
 
 
-def exact_anchors(frame,model,check,budget=1):
+def exact_anchors(frame,model,check,budget=1,*,maximum=80, candidate_limit=800):
     """Find near-identical native sizes by intersecting a few color anchors."""
-    if model.flat or min(model.width,model.height)<4 or max(model.width,model.height)>80:
+    if model.flat or min(model.width,model.height)<4 or max(model.width,model.height)>maximum:
         return [],False
     pixels=np.asarray(frame)
     h,w=model.pixels.shape[:2]
@@ -226,31 +226,45 @@ def exact_anchors(frame,model,check,budget=1):
     if rows<=0 or cols<=0:
         return [],False
     flat=model.pixels.reshape(-1,3).astype(np.int16)
-    center=np.median(flat,axis=0)
+    center=np.median(flat[::max(1,len(flat)//2048)],axis=0)
     coordinates=[]
     for area in np.array_split(np.arange(h),3):
         zone=flat[area[0]*w:(area[-1]+1)*w]
-        best=int(np.argmax(np.abs(zone-center).max(axis=1)))+area[0]*w
+        stride=max(1,len(zone)//12000)
+        best=int(np.argmax(np.abs(zone[::stride]-center).max(axis=1)))*stride+area[0]*w
         coordinates.append(divmod(best,w))
     grid=None
-    for y,x in coordinates:
+    if candidate_limit<800 and min(h,w)>=24:
+        # Color extremes can repeat across monochrome illustrations. Use
+        # additional points along structure to narrow dense candidate maps.
+        gray=model.gray
+        edges=cv2.Laplacian(gray,cv2.CV_16S)
+        for ys in np.array_split(np.arange(h),3):
+            for xs in np.array_split(np.arange(w),2):
+                grad=np.abs(edges[ys[0]:ys[-1]+1,xs[0]:xs[-1]+1])
+                at_y,at_x=np.unravel_index(np.argmax(grad),grad.shape)
+                coordinates.append((ys[0]+at_y,xs[0]+at_x))
+    for i,(y,x) in enumerate(coordinates):
         check()
         color=model.pixels[y,x].astype(np.int16)
         low=np.maximum(0,color-4).astype(np.uint8)
         high=np.minimum(255,color+4).astype(np.uint8)
         allowed=cv2.inRange(pixels[y:y+rows,x:x+cols],low,high)
         grid=allowed if grid is None else cv2.bitwise_and(grid,allowed)
-        if not cv2.countNonZero(grid):
+        remaining=cv2.countNonZero(grid)
+        if not remaining:
             return [],False
+        if i>=2 and remaining<=candidate_limit*budget:
+            break
     expected=cv2.countNonZero(grid)
-    if expected>800*budget:
+    if expected>candidate_limit*budget:
         return [],True
     positions=cv2.findNonZero(grid)
     matches=[]
     for x,y in positions.reshape(-1,2):
         check()
         patch=pixels[y:y+h,x:x+w]
-        if np.abs(patch.astype(np.int16)-model.pixels).max()<=5:
+        if cv2.norm(patch,model.pixels,cv2.NORM_INF)<=5:
             matches.append((1.,int(x),int(y),w,h))
     return matches,False
 

@@ -4,6 +4,7 @@ import numpy as np
 from recognition_features import Model, Screen, rgb
 from recognition_search import orientation_candidates, pixel_candidates
 from recognition_verify import verify
+from recognition_pose import pose_candidates
 from recognition_outline import outline_candidates
 from recognition_multiscale import (background,color_boxes,compare_glyphs,glyphs,
                                     exact_anchors,glyph_candidates,proportional,small_size_candidates,text_variants,tiny_pixels,tiny_size_candidates,verify_text,wide_candidates)
@@ -223,7 +224,7 @@ def match(frame, template, threshold=.9, scales=(1.,), offset=(.5,.5), check=Non
 
 
 def search_regions(frame, template, regions, origin, configured, source_dpi,
-                   threshold, offset, check=None, *, budget=1, quick=False):
+                   threshold, offset, check=None, *, budget=1, quick=False, fast=False):
     if not regions:
         raise RuntimeError('검색 가능한 모니터 없음')
     model = template if isinstance(template, Model) else Model(template)
@@ -240,7 +241,11 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
     def examine(recovery):
         found, failures = [], []
         for region,crop,scales in prepared:
-            r = match(crop,model,threshold,scales,offset,check,recovery=recovery,adaptive=adaptive,budget=budget)
+            if recovery=='fast_anchors':
+                candidates,limited=exact_anchors(crop,model,check or (lambda:None),budget,maximum=8000,candidate_limit=24)
+                r=_resolve(pose_matches(candidates,model,offset,'exact_rgb'),limited)
+            else:
+                r = match(crop,model,threshold,scales,offset,check,recovery=recovery,adaptive=adaptive,budget=budget)
             r['monitor'] = region['device']
             if r['box']:
                 x,y,_,_ = region['rect']
@@ -255,13 +260,29 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
             return _resolve(found,limited)
         return next((r for r in failures if r['status']=='incomplete'),failures[0])
 
-    if 1. in configured and not model.flat and max(model.width,model.height)<=80:
-        anchors=examine('anchors')
+    if 1. in configured and not model.flat and (fast or max(model.width,model.height)<=80):
+        anchors=examine('fast_anchors' if fast else 'anchors')
         if anchors['status'] in ('found','ambiguous'):
             return anchors
+    if fast and quick and len(prepared)>1 and not model.flat and 1. in configured:
+        return _result('incomplete','원본 크기 검색 완료 · 다른 크기 계속 확인 중')
+    if fast and min(model.width,model.height)>=24 and (min(model.width,model.height)>=160 or len(prepared)==1):
+        pose=[]
+        for region,crop,_ in prepared:
+            x,y,_,_=region['rect']
+            for hit in pose_candidates(crop,model,threshold,offset,check or (lambda:None)):
+                a,b,w,h=hit['box']
+                px,py=hit['point']
+                pose.append(dict(hit,box=(a+x,b+y,w,h),point=(px+x,py+y),monitor=region['device'],method='pose'))
+        if pose:
+            return _resolve(pose,False)
+        if quick and min(model.width,model.height)>=160:
+            return _result('incomplete','빠른 검색 완료 · 새 화면 확인 중')
     result=examine(False)
     if result['status'] in ('found','ambiguous','insufficient'):
         return result
+    if quick and fast:
+        return _result('incomplete','빠른 검색 완료 · 새 화면 확인 중')
     glyph=examine('glyph') if adaptive else _result('not_found','추가 후보 없음')
     if glyph['status'] in ('found','ambiguous'):
         return glyph
@@ -289,7 +310,16 @@ def recheck(frame, model, previous, threshold, offset, check=None):
     _,_,old_w,old_h = previous['box']
     if check:
         check()
+    if previous.get('method')=='pose':
+        hits=pose_candidates(frame,model,threshold,offset,check or (lambda:None),
+                             local=(previous['scale'],previous.get('angle',0)))
+        return _resolve(hits,False)
     screen = Screen(frame)
+    if previous.get('method')=='exact_rgb':
+        patch=screen.pixels[y:y+h,x:x+w]
+        if patch.shape==model.pixels.shape and cv2.norm(patch,model.pixels,cv2.NORM_INF)<=5:
+            point=x+min(w-1,round(w*offset[0])),y+min(h-1,round(h*offset[1]))
+            return _result('found','발견',dict(previous,point=point))
     if previous.get('method')=='tiny_rgb':
         pixels=tiny_pixels(model,w,h)
         patch=screen.pixels[y:y+h,x:x+w]

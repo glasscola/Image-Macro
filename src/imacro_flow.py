@@ -177,8 +177,30 @@ class Workflow:
             raise Jump(uid,dict(result,point=point))
 
     def execute_workflow(self):
-        self.position=0
+        if not any(step['enabled'] for step in self.top_steps):
+            return
         self.start_watch_thread()
+        limit=self.p.get('workflow_repeats',1)
+        cycle=0
+        while not limit or cycle<limit:
+            cycle+=1
+            self.position=0
+            self.repeat,self.repeat_count=None,0
+            self.carried=None
+            self.results.clear()
+            self.emit('workflow_iteration',(cycle,limit))
+            self.execute_workflow_pass()
+            if (not limit or cycle<limit) and len(self.top_steps)==1:
+                first=self.top_steps[0]
+                found=self.results.get(first['id'])
+                if first['kind']=='image' and first['enabled'] and found and found[1]['found'] and not first.get('repeat_while_visible'):
+                    result=found[1]
+                    while result is not None:
+                        result=self.verify_disappearance(first,result)
+            if not limit or cycle<limit:
+                self.sleep(.025)
+
+    def execute_workflow_pass(self):
         while self.position<len(self.top_steps):
             step=self.top_steps[self.position]
             repeat=self.repeat_for.get(self.position)

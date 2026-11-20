@@ -35,6 +35,9 @@ def walk(steps):
 
 def validate(p,ready=True):
     if p.get('format')!='ImageMacro' or p.get('version')!=1: raise ValueError('지원하지 않는 프로젝트 형식입니다.')
+    count=p.get('workflow_repeats',1)
+    if type(count) is not int or not 0<=count<=100000:
+        raise ValueError('전체 반복 횟수 오류')
     ids=set()
     def number(v,lo,hi):
         if not isinstance(v,(int,float)) or not math.isfinite(v) or not lo<=v<=hi: raise ValueError('숫자 설정 범위 오류')
@@ -48,6 +51,8 @@ def validate(p,ready=True):
             if len(ids)>10000: raise ValueError('단계가 너무 많습니다.')
             if 'wait_forever' in s and type(s['wait_forever']) is not bool:
                 raise ValueError('기다림 설정 오류')
+            if type(s.get('advance_on_next',False)) is not bool:
+                raise ValueError('다음 이미지 이동 설정 오류')
             repeat=s.get('repeat_while_visible',False)
             if type(repeat) is not bool or (repeat and s['kind']!='image'):
                 raise ValueError('이미지 반복 설정 오류')
@@ -144,6 +149,9 @@ class Runner(Workflow):
         self.route_frame = None
         self.templates={k:Model(decode_image(v['data'])) for k,v in p['images'].items()}
         self.init_flow()
+        if self.native_capture and not self.output:
+            from desktop import Input
+            self.input=Input()
         self.has_legacy_live_watch=any(s['kind']=='loop' and s['watch'] and s['watch_timing']=='during'
                                        for s in walk(self.p['steps']))
 
@@ -215,7 +223,7 @@ class Runner(Workflow):
             r=results.get(key)
             if r is None:
                 r=search_regions(frame,template,regions,origin,s['scales'],source_dpi,
-                                 s['threshold'],s['offset'],cancel,budget=budget,quick=quick)
+                                 s['threshold'],s['offset'],cancel,budget=budget,quick=quick,fast=True)
                 if len(results)>=48:
                     results.pop(next(iter(results)))
                 results[key]=r.copy()
@@ -389,6 +397,28 @@ class Runner(Workflow):
             self.gesture_held.clear()
 
     def wait_image(self,s):
+        if not self.native_capture or s['kind'] not in ('image','wait') or s['image_mode']=='once':
+            return self.poll_image(s)
+        stop=threading.Event()
+        try:
+            return self.poll_image(s, recovery_stop=stop)
+        finally:
+            stop.set()
+
+    def start_image_recovery(self,step,stop,result):
+        def checkpoint():
+            if stop.is_set() or self.cancel.is_set():
+                raise Halt()
+        try:
+            candidate=self.probe(step,diagnostic=False,checkpoint=checkpoint,budget=2)
+            if candidate['found'] and not stop.is_set():
+                result.append(candidate)
+        except (Halt,CaptureError):
+            pass
+        except Exception as error:
+            result.append(error)
+
+    def poll_image(self,s,recovery_stop=None):
         if self.carried and self.carried[0]==s['id']:
             _,result=self.carried
             self.carried=None
@@ -400,15 +430,35 @@ class Runner(Workflow):
         hits=0
         old=None
         previous=None
+        recovery=None
+        recovered=[]
+        next_recovery=time.monotonic()+(.16 if s['roi'] is None else .32)
         while True:
             started=time.monotonic()
             paused=self.paused_time
             self.check()
             self.boundary()
+            quick=False
             try:
                 point=self.confirm_target(s,previous) if self.native_capture and hits and previous else None
                 if point is None:
-                    r=self.probe(s,budget=budget,quick=(checks%4!=3 if s.get('moving') else self.native_capture and not once and checks<2))
+                    quick=recovery_stop is not None or (s.get('moving') and checks%4!=3)
+                    candidate=recovered.pop() if recovered else None
+                    if isinstance(candidate,Exception):
+                        raise candidate
+                    point=self.confirm_target(s,candidate) if candidate else None
+                    if point is not None:
+                        x,y,w,h=candidate['box']
+                        px,py=candidate['point']
+                        r=dict(candidate,point=point,box=(x+point[0]-px,y+point[1]-py,w,h))
+                    else:
+                        r=self.probe(s,budget=budget,quick=quick)
+                    if quick and recovery_stop and not r['found'] and checks>=2 and started>=next_recovery and (
+                            recovery is None or not recovery.is_alive()):
+                        recovery=threading.Thread(target=self.start_image_recovery,
+                                                  args=(s,recovery_stop,recovered),daemon=True)
+                        recovery.start()
+                        next_recovery=started+.18
                 else:
                     x,y,w,h=previous['box']
                     px,py=previous['point']
@@ -434,9 +484,9 @@ class Runner(Workflow):
                     with self.route_lock:
                         self.seen_images.add(s['id'])
                 return r
-            budget=min(8,budget*2) if status=='incomplete' and checks>2 else 1
+            budget=min(8,budget*2) if status=='incomplete' and not quick and checks>2 else 1
             self.emit('waiting',(s['id'],round(elapsed),status,r['reason']))
-            self.sleep(max(0,(.022 if s.get('moving') else .045)-(time.monotonic()-started)))
+            self.sleep(max(0,(.015 if recovery_stop is not None else .045)-(time.monotonic()-started)))
             elapsed+=time.monotonic()-started-(self.paused_time-paused)
             if not s.get('wait_forever') and elapsed>=s['timeout']:
                 if s['kind']=='wait' or status in ('ambiguous','insufficient','incomplete'):
@@ -459,6 +509,67 @@ class Runner(Workflow):
         self.send('configured_click',*point,action['button'],action['clicks'],action['interval'])
         self.emit('log',f'{source["name"]} · 클릭 입력 전달')
 
+    def presence(self, image, previous=None):
+        if previous and previous.get('box'):
+            point=self.confirm_target(image,previous)
+            if point is not None:
+                x,y,w,h=previous['box']
+                px,py=previous['point']
+                return dict(previous,point=point,box=(x+point[0]-px,y+point[1]-py,w,h))
+        return self.probe(image)
+
+    def verify_disappearance(self, image, result, following=None):
+        misses=0
+        uncertain=0
+        next_hits=0
+        next_candidate=None
+        while misses<2:
+            self.sleep(.025)
+            if following:
+                detected=self.wait_image_candidate(following)
+                if detected:
+                    spread=180 if following.get('moving') else 8
+                    near=next_candidate and max(abs(a-b) for a,b in zip(detected['point'],next_candidate['point']))<spread
+                    next_hits=next_hits+1 if near else 1
+                    next_candidate=detected
+                    if next_hits>=following['stable']:
+                        self.carried=(following['id'],detected)
+                        self.emit('log',f'{following["name"]} · 다음 이미지 발견')
+                        return None
+                else:
+                    next_hits=0
+                    next_candidate=None
+            try:
+                current=self.presence(image,result)
+            except CaptureError:
+                current=dict(found=False,status='capture_error',reason='화면을 읽을 수 없습니다')
+            if current['found']:
+                return current
+            if current['status']=='not_found':
+                misses+=1
+                uncertain=0
+            else:
+                misses=0
+                uncertain+=1
+                self.emit('waiting',(image['id'],0,current['status'],current['reason']))
+                if uncertain>=20:
+                    raise RuntimeError(current['reason'])
+            if misses==1:
+                self.emit('waiting',(image['id'],0,'disappearing','다음 화면에서 다시 확인합니다'))
+        self.emit('log',f'{image["name"]} · 사라짐 확인')
+        return None
+
+    def next_image(self, image):
+        if not image.get('advance_on_next') or self.position is None:
+            return None
+        if self.top_steps[self.position]['id'] != image['id']:
+            return None
+        index=self.position+1
+        if index>=len(self.top_steps):
+            return None
+        step=self.top_steps[index]
+        return step if step['enabled'] and step['kind']=='image' else None
+
     def execute_image_actions(self, image, result):
         uid=image['id']
         repeat=image.get('repeat_while_visible',False)
@@ -470,18 +581,20 @@ class Runner(Workflow):
             if image['image_action']=='click':
                 self.click_detected_image(image,result,image,retry=not repeat)
             self.execute(image['children'])
+            following=self.next_image(image)
             if not repeat:
                 return
-            # Finish the current sequence before testing whether another pass is due.
-            self.sleep(.06)
-            self.check()
-            self.boundary()
-            result=self.probe(image,budget=8)
-            if not result['found']:
-                if result['status']=='not_found':
-                    return
-                raise RuntimeError(result['reason'])
+            result=self.verify_disappearance(image,result,following)
+            if result is None:
+                return
             iteration+=1
+
+    def wait_image_candidate(self,image):
+        try:
+            result=self.probe(image)
+        except CaptureError:
+            return None
+        return result if result['found'] else None
 
     def execute(self,items):
         for s in items:
@@ -494,6 +607,8 @@ class Runner(Workflow):
                 if k in ('image','wait','find','condition'):
                     r=self.wait_image(s)
                     self.results[s['id']]=(s,r)
+                    if r['found']:
+                        self.emit('log',f'{s["name"]} · 인식 확정 · {r.get("scale",1):.0%} · 위치 {r.get("point")}')
                     if k=='image':
                         if r['found']:
                             self.execute_image_actions(s,r)

@@ -6,11 +6,11 @@ Windows 화면에서 지정한 이미지가 보이면 마우스와 키보드 행
 
 ## 설치와 사용
 
-1. [v14 Windows x64 배포](https://github.com/glasscola/Image-Macro/releases/tag/v14)에서 ZIP을 내려받아 모두 풉니다.
+1. [v16 Windows x64 배포](https://github.com/glasscola/Image-Macro/releases/tag/v16)에서 ZIP을 내려받아 모두 풉니다.
 2. 압축을 푼 Image Macro 폴더의 `Image Macro.exe`를 실행합니다.
 3. **화면에서 대상 선택**으로 이미지를 등록하고, 카드 안의 **이 이미지가 보이면 할 행동**으로 클릭이나 녹화를 추가합니다.
 
-[캡처가 포함된 한국어 사용설명서 PDF](docs/ImageMacro-v14-Manual-KO.pdf)
+[한국어 사용설명서 PDF (v14 화면)](docs/ImageMacro-v14-Manual-KO.pdf) · [v16 실제 클릭 검증 결과](docs/ImageMacro-v16-Benchmark-KO.md)
 
 ## 소스에서 실행
 
