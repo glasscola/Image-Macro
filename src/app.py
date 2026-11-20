@@ -78,13 +78,13 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.drag=None
         self.line=None
         self.tray_ready=False
+        self.tray_hidden=False
         self.build()
         self.hotkeys=keyboard.GlobalHotKeys({
             '<f7>':lambda:self.queue.put(('record_end_request',None)),
             '<f10>':lambda:self.queue.put(('stop','F10 단축키'))})
         self.hotkeys.start()
         self.tray=RunTray(icon,self.queue)
-        self.bind('<Unmap>',self.minimized,add='+')
         self.bind('<Destroy>',self.close_tray,add='+')
         self.after(30,self.poll)
         self.protocol('WM_DELETE_WINDOW',self.close)
@@ -117,6 +117,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.file_button.pack(side='left',padx=18)
         self.run_button=self.button(bar,'▶  실행',self.run,True)
         self.run_button.pack(side='right')
+        self.tray_button=self.button(bar,'알림 영역으로',self.send_to_tray)
+        self.tray_button.configure(state='disabled')
+        self.tray_button.pack(side='right',padx=(0,8))
         self.cycle_button=self.button(bar,'전체 실행 · 1회',self.choose_cycles)
         self.cycle_button.pack(side='right',padx=8)
         self.cycle_caption=''
@@ -279,18 +282,25 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if event.widget is self:
             self.tray.close()
 
-    def minimized(self,event):
-        if event.widget is self:
-            self.after_idle(self.hide_minimized)
-
-    def hide_minimized(self):
-        if self.tray_ready and self.state()=='iconic':
-            self.withdraw()
+    def send_to_tray(self):
+        if not self.tray_ready or self.recorder or self.grab_current():
+            return
+        try:
+            self.update_tray()
+            self.tray.show()
+        except (RuntimeError,OSError) as error:
+            self.status.configure(text=str(error))
+            return
+        self.tray_hidden=True
+        self.withdraw()
 
     def restore_from_tray(self):
         self.deiconify()
         self.lift()
         self.focus_force()
+        if self.tray_hidden:
+            self.tray_hidden=False
+            self.tray.hide()
 
     def update_tray(self):
         if self.tray_ready:
@@ -1362,8 +1372,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.run_status='실행 중'
         self.cycle_caption=''
         self.run_button.pack_forget()
-        self.stop_button.pack(side='right')
-        self.pause_button.pack(side='right',padx=8)
+        self.stop_button.pack(side='right',before=self.tray_button)
+        self.pause_button.pack(side='right',before=self.tray_button,padx=8)
         self.status.configure(text='실행 중 · F10 정지')
         self.render()
         exclude(self)
@@ -1397,11 +1407,12 @@ class App(WorkflowEditor,TkinterDnD.Tk):
     def event(self,kind,value):
         if kind=='tray_ready':
             self.tray_ready=True
-            self.update_tray()
-            self.hide_minimized()
+            self.tray_button.configure(state='normal')
         elif kind=='tray_unavailable':
             self.tray_ready=False
-            if self.state()=='withdrawn' and not self.recorder:
+            self.tray_button.configure(state='disabled')
+            if self.tray_hidden:
+                self.tray_hidden=False
                 self.deiconify()
                 self.iconify()
         elif kind=='tray_restore':
@@ -1505,7 +1516,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 self.restore_from_tray()
             self.pause_button.pack_forget()
             self.stop_button.pack_forget()
-            self.run_button.pack(side='right')
+            self.run_button.pack(side='right',before=self.tray_button)
             self.status.configure(text=(self.last_error or self.run_status) if self.run_status=='오류' else self.run_status)
             self.render()
 

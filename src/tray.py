@@ -50,12 +50,7 @@ class RunTray:
             if self.closed.is_set():
                 icon.stop()
                 return
-            try:
-                icon.visible = True
-            except Exception:
-                icon.stop()
-            else:
-                events.put(('tray_ready', None))
+            events.put(('tray_ready', None))
 
         def run():
             try:
@@ -70,6 +65,12 @@ class RunTray:
         self.status, self.active = status, active
         self.icon.title = f'Image Macro · {status}'
         self.icon.update_menu()
+
+    def show(self):
+        self.icon.visible = True
+
+    def hide(self):
+        self.icon.visible = False
 
     def close(self):
         self.closed.set()
