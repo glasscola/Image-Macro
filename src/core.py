@@ -811,5 +811,7 @@ class Runner(Workflow):
             try:
                 if not self.output and hasattr(self,'input'):
                     self.input.release()
+            except Exception as error:
+                self.emit('log',f'입력 정리 중 오류 · {error}')
             finally:
                 self.emit('done',None)

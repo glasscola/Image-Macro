@@ -26,7 +26,6 @@ import desktop
 core.cv2.setNumThreads(2)
 from recording import Recorder
 from screen_ui import select_screen, exclude, root_window_at, user
-from tray import RunTray
 from imacro_flow import validate_flow
 from workflow_editor import WorkflowEditor
 
@@ -51,8 +50,6 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         super().__init__()
         self.title('Image Macro')
         icon = Path(__file__).with_name('image-macro.ico')
-        if icon.exists():
-            self.iconbitmap(default=str(icon))
         self.collapsed = set()
         self.picker = None
         self.geometry('1060x720')
@@ -77,15 +74,22 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.log=[]
         self.drag=None
         self.line=None
-        self.tray_ready=False
-        self.tray_hidden=False
+        self.hotkeys=None
+        startup_errors=[]
+        try:
+            if icon.is_file():
+                self.iconbitmap(default=str(icon))
+        except (OSError,tk.TclError) as error:
+            startup_errors.append(f'창 아이콘 · {error}')
         self.build()
-        self.hotkeys=keyboard.GlobalHotKeys({
-            '<f7>':lambda:self.queue.put(('record_end_request',None)),
-            '<f10>':lambda:self.queue.put(('stop','F10 단축키'))})
-        self.hotkeys.start()
-        self.tray=RunTray(icon,self.queue)
-        self.bind('<Destroy>',self.close_tray,add='+')
+        try:
+            listener=keyboard.GlobalHotKeys({
+                '<f7>':lambda:self.queue.put(('record_end_request',None)),
+                '<f10>':lambda:self.queue.put(('stop','F10 단축키'))})
+            listener.start()
+            self.hotkeys=listener
+        except (OSError,RuntimeError) as error:
+            startup_errors.append(f'전역 단축키 · {error}')
         self.after(30,self.poll)
         self.protocol('WM_DELETE_WINDOW',self.close)
         for key,fn in [('Control-s',self.save),('Control-o',self.open),
@@ -95,6 +99,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if path:
             self.read(Path(path))
         self.render()
+        if startup_errors:
+            self.log.extend(startup_errors)
+            self.status.configure(text='일부 보조 기능을 시작하지 못했습니다. 실행 기록을 확인하세요.')
 
     def button(self,parent,label,command,primary=False):
         return tk.Button(parent,text=label,command=command,padx=14,pady=7,
@@ -107,19 +114,19 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         bar=tk.Frame(self,bg=WHITE,padx=24,pady=14,highlightthickness=1,highlightbackground=LINE)
         bar.pack(fill='x')
         icon=Path(__file__).with_name('image-macro.ico')
-        if icon.exists():
+        try:
             with Image.open(icon) as original:
                 mark=original.resize((32,32),Image.Resampling.LANCZOS)
-            self.brand_icon=ImageTk.PhotoImage(mark)
+            self.brand_icon=ImageTk.PhotoImage(mark,master=self)
+        except (OSError,tk.TclError):
+            pass
+        else:
             tk.Label(bar,image=self.brand_icon,bg=WHITE).pack(side='left',padx=(0,9))
         tk.Label(bar,text='Image Macro',font=('Segoe UI',19,'bold'),bg=WHITE,fg=INK).pack(side='left')
         self.file_button=self.button(bar,'새 작업  ▾',self.file_menu)
         self.file_button.pack(side='left',padx=18)
         self.run_button=self.button(bar,'▶  실행',self.run,True)
         self.run_button.pack(side='right')
-        self.tray_button=self.button(bar,'알림 영역으로',self.send_to_tray)
-        self.tray_button.configure(state='disabled')
-        self.tray_button.pack(side='right',padx=(0,8))
         self.cycle_button=self.button(bar,'전체 실행 · 1회',self.choose_cycles)
         self.cycle_button.pack(side='right',padx=8)
         self.cycle_caption=''
@@ -275,36 +282,15 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.after(80,self.close)
             return
         if self.abandon():
-            self.hotkeys.stop()
+            if self.hotkeys is not None:
+                self.hotkeys.stop()
             self.destroy()
 
-    def close_tray(self,event):
-        if event.widget is self:
-            self.tray.close()
-
-    def send_to_tray(self):
-        if not self.tray_ready or self.recorder or self.grab_current():
-            return
+    def update_capture_exclusion(self,enabled):
         try:
-            self.update_tray()
-            self.tray.show()
-        except (RuntimeError,OSError) as error:
-            self.status.configure(text=str(error))
-            return
-        self.tray_hidden=True
-        self.withdraw()
-
-    def restore_from_tray(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-        if self.tray_hidden:
-            self.tray_hidden=False
-            self.tray.hide()
-
-    def update_tray(self):
-        if self.tray_ready:
-            self.tray.update(self.run_status or '준비',self.runner is not None)
+            exclude(self,enabled)
+        except (OSError,tk.TclError) as error:
+            self.event('log',f'편집기 캡처 제외 · {error}')
 
     def locate(self,uid,items=None):
         if items is None:
@@ -1369,20 +1355,45 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.log=[]
         self.diagnostics.pack(side='right',padx=12)
         self.last_error=''
-        self.run_status='실행 중'
+        self.run_status='시작 중'
         self.cycle_caption=''
         self.run_button.pack_forget()
-        self.stop_button.pack(side='right',before=self.tray_button)
-        self.pause_button.pack(side='right',before=self.tray_button,padx=8)
-        self.status.configure(text='실행 중 · F10 정지')
+        self.stop_button.pack(side='right')
+        self.pause_button.configure(text='일시정지',state='disabled')
+        self.pause_button.pack(side='right',padx=8)
+        self.status.configure(text=self.run_status)
         self.render()
-        exclude(self)
-        self.update_tray()
-        self.iconify()
-        self.after(70,lambda:threading.Thread(target=self.runner.run,daemon=True).start())
+        try:
+            self.update_capture_exclusion(True)
+            self.iconify()
+            self.after(70,self.start_runner)
+        except (OSError,RuntimeError,tk.TclError) as error:
+            self.fail_run_start(error)
+
+    def start_runner(self):
+        runner=self.runner
+        if runner.cancel.is_set():
+            self.event('state','정지됨')
+            self.event('done',None)
+            return
+
+        def execute():
+            self.queue.put(('run_started',None))
+            runner.run()
+
+        try:
+            threading.Thread(target=execute,daemon=True).start()
+        except (OSError,RuntimeError) as error:
+            self.fail_run_start(error)
+
+    def fail_run_start(self,error):
+        self.last_error=f'실행 시작 실패 · {error}'
+        self.event('log',self.last_error)
+        self.event('state','오류')
+        self.event('done',None)
 
     def pause(self):
-        if self.runner:
+        if self.runner and self.run_status in ('실행 중','일시정지') and not self.runner.cancel.is_set():
             paused=not self.runner.paused.is_set()
             (self.runner.paused.set if paused else self.runner.paused.clear)()
             self.pause_button.configure(text='계속' if paused else '일시정지')
@@ -1390,7 +1401,6 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 self.set_state(self.current,'paused' if paused else 'running','일시정지' if paused else '실행 중')
             self.run_status='일시정지' if paused else '실행 중'
             self.status.configure(text=self.run_status)
-            self.update_tray()
 
     def stop(self,reason='창의 정지 버튼'):
         if self.runner and not self.runner.cancel.is_set():
@@ -1405,24 +1415,12 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.paint(self.visible_parent[uid])
 
     def event(self,kind,value):
-        if kind=='tray_ready':
-            self.tray_ready=True
-            self.tray_button.configure(state='normal')
-        elif kind=='tray_unavailable':
-            self.tray_ready=False
-            self.tray_button.configure(state='disabled')
-            if self.tray_hidden:
-                self.tray_hidden=False
-                self.deiconify()
-                self.iconify()
-        elif kind=='tray_restore':
-            self.restore_from_tray()
-        elif kind=='tray_pause':
-            self.pause()
-        elif kind=='tray_exit':
-            if self.runner:
-                self.stop('알림 영역 종료')
-            self.close()
+        if kind=='run_started':
+            self.run_status='실행 중'
+            if not self.runner.cancel.is_set():
+                self.pause_button.configure(state='normal')
+                label='실행 중 · F10 정지' if self.hotkeys is not None else '실행 중'
+                self.status.configure(text=label)
         elif kind=='input_blocked':
             message='편집기가 입력 위치를 가리고 있습니다. 창을 최소화하면 계속합니다.'
             self.status.configure(text=message)
@@ -1508,15 +1506,16 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='done':
             self.last_runner=self.runner
             self.runner=None
-            exclude(self,False)
-            self.update_tray()
+            self.update_capture_exclusion(False)
             if self.run_status=='정지됨' and self.current and self.states.get(self.current,('',''))[0] in ('running','paused'):
                 self.set_state(self.current,'stopped','■ 정지됨')
             if self.run_status=='오류':
-                self.restore_from_tray()
+                self.deiconify()
+                self.lift()
+                self.focus_force()
             self.pause_button.pack_forget()
             self.stop_button.pack_forget()
-            self.run_button.pack(side='right',before=self.tray_button)
+            self.run_button.pack(side='right')
             self.status.configure(text=(self.last_error or self.run_status) if self.run_status=='오류' else self.run_status)
             self.render()
 
