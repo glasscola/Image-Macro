@@ -71,6 +71,11 @@ def pointer_window(x, y):
     return window_info(user.WindowFromPoint(win.POINT(x, y)))
 
 
+def root_window_at(x,y):
+    hwnd=user.WindowFromPoint(win.POINT(x,y))
+    return user.GetAncestor(hwnd,2) if hwnd else None
+
+
 def screen_point(x, y, origin=None):
     pt = win.POINT()
     if origin is None:
@@ -137,7 +142,7 @@ def focus_window(target):
         raise TargetUnavailable(f'기록한 창을 활성화해 주세요 · {target["title"]}')
 
 
-def resolve(anchor,require_visible=True,*,activate=False):
+def resolve(anchor,require_visible=True,*,activate=False,wait_if_covered=None):
     hwnd=find_window(anchor)
     if activate:
         if user.IsIconic(hwnd):
@@ -156,6 +161,8 @@ def resolve(anchor,require_visible=True,*,activate=False):
         point=screen_point(round(anchor['dx']*ratio),round(anchor['dy']*ratio),hwnd)
     except RuntimeError as error:
         raise TargetUnavailable(str(error)) from error
+    if wait_if_covered is not None:
+        wait_if_covered(*point)
     hit = pointer_window(*point)
     if require_visible and (not hit or hit['handle'] != hwnd):
         raise TargetUnavailable(f'기록한 위치가 다른 창에 가려져 있습니다 · {anchor["title"]}')

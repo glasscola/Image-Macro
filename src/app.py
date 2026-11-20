@@ -25,7 +25,8 @@ import desktop
 # Leave CPU time for the input executor while a watch runs.
 core.cv2.setNumThreads(2)
 from recording import Recorder
-from screen_ui import select_screen, exclude
+from screen_ui import select_screen, exclude, root_window_at, user
+from tray import RunTray
 from imacro_flow import validate_flow
 from workflow_editor import WorkflowEditor
 
@@ -76,12 +77,15 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.log=[]
         self.drag=None
         self.line=None
-        self.progress=None
+        self.tray_ready=False
         self.build()
         self.hotkeys=keyboard.GlobalHotKeys({
             '<f7>':lambda:self.queue.put(('record_end_request',None)),
             '<f10>':lambda:self.queue.put(('stop','F10 단축키'))})
         self.hotkeys.start()
+        self.tray=RunTray(icon,self.queue)
+        self.bind('<Unmap>',self.minimized,add='+')
+        self.bind('<Destroy>',self.close_tray,add='+')
         self.after(30,self.poll)
         self.protocol('WM_DELETE_WINDOW',self.close)
         for key,fn in [('Control-s',self.save),('Control-o',self.open),
@@ -260,7 +264,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def close(self):
         if self.runner:
-            self.stop()
+            self.stop('창 닫기')
             self.after(100,self.close)
             return
         if self.recorder:
@@ -270,6 +274,27 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if self.abandon():
             self.hotkeys.stop()
             self.destroy()
+
+    def close_tray(self,event):
+        if event.widget is self:
+            self.tray.close()
+
+    def minimized(self,event):
+        if event.widget is self:
+            self.after_idle(self.hide_minimized)
+
+    def hide_minimized(self):
+        if self.tray_ready and self.state()=='iconic':
+            self.withdraw()
+
+    def restore_from_tray(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def update_tray(self):
+        if self.tray_ready:
+            self.tray.update(self.run_status or '준비',self.runner is not None)
 
     def locate(self,uid,items=None):
         if items is None:
@@ -1322,7 +1347,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if not self.editable() or not self.rows:
             return
         try:
-            self.runner=core.Runner(copy.deepcopy(self.project),lambda k,v:self.queue.put((k,v)))
+            editor_handle=user.GetAncestor(self.winfo_id(),2)
+            self.runner=core.Runner(copy.deepcopy(self.project),lambda k,v:self.queue.put((k,v)),
+                                    editor_at=lambda x,y:bool(editor_handle) and root_window_at(x,y)==editor_handle)
         except Exception as e:
             messagebox.showerror('실행 준비',str(e),parent=self)
             return
@@ -1339,22 +1366,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.pause_button.pack(side='right',padx=8)
         self.status.configure(text='실행 중 · F10 정지')
         self.render()
-        if len(desktop.monitors())<=1:
-            self.withdraw()
-            self.progress=tk.Toplevel(self)
-            self.progress.title('Image Macro 실행 중')
-            self.progress.attributes('-topmost',True)
-            self.progress.geometry('420x106+12+12')
-            self.progress.configure(bg=WHITE,padx=14,pady=8)
-            self.progress.protocol('WM_DELETE_WINDOW',self.stop)
-            self.progress_label=tk.Label(self.progress,text='실행 중',bg=WHITE,fg=INK,anchor='w')
-            self.progress_label.pack(fill='x')
-            self.button(self.progress,'정지 · F10',self.stop).pack(side='right',pady=4)
-            self.progress_pause=self.button(self.progress,'일시정지',self.pause)
-            self.progress_pause.pack(side='right',padx=6,pady=4)
-            exclude(self.progress)
-        else:
-            exclude(self)
+        exclude(self)
+        self.update_tray()
+        self.iconify()
         self.after(70,lambda:threading.Thread(target=self.runner.run,daemon=True).start())
 
     def pause(self):
@@ -1362,15 +1376,15 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             paused=not self.runner.paused.is_set()
             (self.runner.paused.set if paused else self.runner.paused.clear)()
             self.pause_button.configure(text='계속' if paused else '일시정지')
-            if self.progress:
-                self.progress_pause.configure(text='계속' if paused else '일시정지')
             if self.current:
                 self.set_state(self.current,'paused' if paused else 'running','일시정지' if paused else '실행 중')
             self.run_status='일시정지' if paused else '실행 중'
             self.status.configure(text=self.run_status)
+            self.update_tray()
 
-    def stop(self):
-        if self.runner:
+    def stop(self,reason='창의 정지 버튼'):
+        if self.runner and not self.runner.cancel.is_set():
+            self.event('log',f'{reason} · 정지 요청')
             self.runner.cancel.set()
 
     def set_state(self,uid,state,label):
@@ -1381,7 +1395,30 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.paint(self.visible_parent[uid])
 
     def event(self,kind,value):
-        if kind=='record_end_request':
+        if kind=='tray_ready':
+            self.tray_ready=True
+            self.update_tray()
+            self.hide_minimized()
+        elif kind=='tray_unavailable':
+            self.tray_ready=False
+            if self.state()=='withdrawn' and not self.recorder:
+                self.deiconify()
+                self.iconify()
+        elif kind=='tray_restore':
+            self.restore_from_tray()
+        elif kind=='tray_pause':
+            self.pause()
+        elif kind=='tray_exit':
+            if self.runner:
+                self.stop('알림 영역 종료')
+            self.close()
+        elif kind=='input_blocked':
+            message='편집기가 입력 위치를 가리고 있습니다. 창을 최소화하면 계속합니다.'
+            self.status.configure(text=message)
+            self.event('log',message)
+        elif kind=='input_clear' and self.runner and not self.runner.paused.is_set() and not self.runner.cancel.is_set():
+            self.status.configure(text='실행 중 · 대기하던 입력 계속')
+        elif kind=='record_end_request':
             if self.recorder:
                 self.toggle_record()
         elif kind=='record_finished':
@@ -1406,8 +1443,6 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             name=self.caption(self.locate(uid)[2])[0]
             text=f'{self.cycle_caption}{self.stage_numbers[uid]}단계 · {name} · {detail}'
             self.status.configure(text=text if status=='not_found' else f'{text} · {reason}')
-            if self.progress:
-                self.progress_label.configure(text=text)
         elif kind=='workflow_iteration':
             n,total=value
             self.cycle_caption=f'전체 {n}/{total}회 · ' if total else f'전체 {n}회차 · '
@@ -1420,9 +1455,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.set_state(uid,'running',f'{iteration}회째 반복 중')
             self.log.append(f'{self.stage_numbers[uid]}단계 · {iteration}회째 반복 중')
         elif kind=='stop':
-            if self.runner and value:
-                self.log.append(f'{value} · 정지 요청')
-            self.stop()
+            self.stop(value or '창의 정지 버튼')
         elif kind=='record_row':
             self.record_row(*value)
         elif kind=='log':
@@ -1437,9 +1470,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             n=self.stage_numbers[value]
             msg=f'{self.cycle_caption}{n} / {len(self.top_numbers)}  ·  {self.caption(s)[0]}  ·  {detail}'
             self.status.configure(text=msg)
-            if self.progress:
-                self.progress_label.configure(text=msg)
-            else:
+            if self.state()=='normal':
                 row=self.rows[self.visible_parent.get(value,value)][0]
                 y=row.winfo_rooty()-self.list.winfo_rooty()
                 if y<self.canvas.canvasy(0) or y+row.winfo_height()>self.canvas.canvasy(self.canvas.winfo_height()):
@@ -1466,14 +1497,12 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='done':
             self.last_runner=self.runner
             self.runner=None
-            if self.progress:
-                self.progress.destroy()
-                self.progress=None
-            else:
-                exclude(self,False)
+            exclude(self,False)
+            self.update_tray()
             if self.run_status=='정지됨' and self.current and self.states.get(self.current,('',''))[0] in ('running','paused'):
                 self.set_state(self.current,'stopped','■ 정지됨')
-            self.deiconify()
+            if self.run_status=='오류':
+                self.restore_from_tray()
             self.pause_button.pack_forget()
             self.stop_button.pack_forget()
             self.run_button.pack(side='right')

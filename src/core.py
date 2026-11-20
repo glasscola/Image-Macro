@@ -146,12 +146,13 @@ class ImageLeft(Exception):
 
 class Runner(Workflow):
     capture_error = CaptureError
-    def __init__(self,p,emit,capture=None,output=None):
+    def __init__(self,p,emit,capture=None,output=None,*,editor_at=None):
         self.p=copy.deepcopy(validate(p)); self.emit=emit
         from desktop import capture_runtime
         self.native_capture=capture is None
         self.capture_source=capture or capture_runtime
         self.output=output; self.cancel=threading.Event(); self.paused=threading.Event()
+        self.editor_at=editor_at
         self.results={}; self.watches=[]; self.last_watch=0; self.held_keys=set(); self.paused_time=0
         self.probe_cache=threading.local()
         self.route_frame = None
@@ -341,6 +342,20 @@ class Runner(Workflow):
             return
         for w in self.watches:
             if w['latched'] and w['s']['watch_apply']=='action': raise Flow(w['s']['watch_action'],w['s']['id'])
+
+    def wait_for_pointer_target(self,x,y):
+        if self.editor_at is None or not self.editor_at(x,y):
+            return False
+        self.emit('input_blocked',None)
+        try:
+            while self.editor_at(x,y):
+                self.sleep(.05)
+            self.check()
+            self.boundary()
+            return True
+        finally:
+            self.emit('input_clear',None)
+
     def send(self,kind,*args):
         self.check()
         self.boundary()
@@ -350,6 +365,7 @@ class Runner(Workflow):
         if not hasattr(self,'input'):self.input=Input()
         inp=self.input
         if kind=='click':
+            self.wait_for_pointer_target(*args[:2])
             inp.click_at(*args[:2],inp.buttons.left);return
         if kind=='configured_click':
             x,y,button,clicks,interval=args
@@ -357,11 +373,14 @@ class Runner(Workflow):
                 if i:
                     self.check()
                     self.boundary()
+                self.wait_for_pointer_target(x,y)
                 inp.click_at(x,y,getattr(inp.buttons,button))
                 if i+1<clicks:self.sleep(interval)
             return
         if kind=='drag':
-            x,y,x2,y2,duration=args;inp.mouse.position=(x,y);inp.mouse.press(inp.buttons.left)
+            x,y,x2,y2,duration=args
+            self.wait_for_pointer_target(x,y)
+            inp.mouse.position=(x,y);inp.mouse.press(inp.buttons.left)
             try:
                 for i in range(1,61):self.sleep(duration/60);inp.mouse.position=(round(x+(x2-x)*i/60),round(y+(y2-y)*i/60))
             finally:inp.mouse.release(inp.buttons.left)
@@ -375,17 +394,25 @@ class Runner(Workflow):
                 for key in reversed(keys):inp.key(key,False)
             return
         if kind=='text':inp.keys.type(args[0]);return
-        if kind=='scroll':inp.mouse.scroll(0,args[0]);return
+        if kind=='scroll':
+            self.wait_for_pointer_target(*inp.mouse.position)
+            inp.mouse.scroll(0,args[0]);return
         if kind=='event':
             e=args[0]
+            guard=self.wait_for_pointer_target if e['type']=='scroll' or e.get('down',False) else None
             if 'x' in e and 'y' in e:
                 if e.get('anchor'):
                     from screen_ui import resolve
                     point=resolve(e['anchor'],e['type']=='scroll' or e.get('down',False),
-                                  activate=e['type']=='mouse' and e.get('down',False))
+                                  activate=e['type']=='mouse' and e.get('down',False),
+                                  wait_if_covered=guard)
                 else:
                     point=(e['x'],e['y'])
+                    if guard:
+                        guard(*point)
                 inp.move_to(*point)
+            elif e['type']=='scroll':
+                self.wait_for_pointer_target(*inp.mouse.position)
             if e['type']=='mouse':
                 inp.mouse_button(getattr(inp.buttons,e['button']), e['down'])
             elif e['type']=='scroll':inp.mouse.scroll(e.get('dx',0),e['dy'])
@@ -553,6 +580,8 @@ class Runner(Workflow):
                     raise
                 point=None
             if point is not None:
+                if self.wait_for_pointer_target(*point):
+                    continue
                 return point,result
             if not (repeat or retry):
                 break
@@ -718,7 +747,9 @@ class Runner(Workflow):
                     self.replay_events(s['events'],s['id'])
                 elif k=='loop': self.loop(s)
                 elif k in ('break','continue'): raise Flow(k)
-                elif k=='stop': raise Halt()
+                elif k=='stop':
+                    self.emit('log',s['name']+' · 작업 순서에서 정지 요청')
+                    raise Halt()
                 self.in_action=False
                 self.emit('step_done',s['id'])
                 self.emit('log',s['name']+' · 완료'); self.boundary()
@@ -753,7 +784,9 @@ class Runner(Workflow):
                                 self.sleep(.10)
                     if w['latched']: raise Flow(s['watch_action'],s['id'])
                 except Flow as f:
-                    if f.action=='stop': raise Halt()
+                    if f.action=='stop':
+                        self.emit('log',s['name']+' · 감시 조건이 충족되어 정지')
+                        raise Halt()
                     if f.owner and f.owner!=s['id']: raise
                     if f.action=='break': break
                     with self.route_lock:
