@@ -62,7 +62,8 @@ class ImageRepeatTests(unittest.TestCase):
         self.assertEqual([c.args[1] for c in self.output.call_args_list],['A','B','C']*3)
         self.assertEqual(runner.wait_image.call_count,3)
 
-    def test_single_image_rearms_only_after_two_misses(self):
+    def test_single_image_rearms_only_after_two_misses_when_requested(self):
+        self.project['repeat_on_reappear']=True
         self.project['workflow_repeats']=2
         self.project['steps']=[self.first]
         runner=self.runner()
@@ -86,3 +87,58 @@ class ImageRepeatTests(unittest.TestCase):
         runner.wait_image=wait
         runner.run()
         self.assertEqual([c.args[1] for c in self.output.call_args_list],['A','B','C'])
+
+    def test_continuous_single_card_repeats_while_still_visible(self):
+        self.project['steps']=[self.first]
+        self.project['workflow_repeats']=0
+        runner=self.runner()
+        runner.sleep=Mock()
+        def run_action(*_):
+            if self.output.call_count==1000:
+                runner.cancel.set()
+        self.output.side_effect=run_action
+        runner.run()
+        self.assertEqual(self.output.call_count,1000)
+        self.assertEqual(runner.wait_image.call_count,500)
+        runner.probe.assert_not_called()
+        self.assertIn(('state','정지됨'),[c.args for c in self.emit.call_args_list])
+
+    def test_waiting_click_reacquires_without_replaying_prior_action(self):
+        click=dict(core.step('click'),source=self.first['id'],configured_target=True)
+        self.first.update(wait_forever=True,children=[self.first['children'][0],click])
+        result=dict(found=True,box=(4,4,12,12),point=(10,10))
+        runner=self.runner()
+        runner.wait_image=Mock(return_value=result)
+        runner.confirm_target=Mock(side_effect=[None,core.CaptureError('temporary'),(10,10)])
+        runner.run()
+        self.assertEqual([call.args[0] for call in self.output.call_args_list],
+                         ['text','configured_click','text'])
+        self.assertEqual(runner.wait_image.call_count,3)
+
+    def test_image_disappears_before_repeat_click_and_next_step_runs(self):
+        click=dict(core.step('click'),source=self.first['id'],configured_target=True)
+        self.first.update(wait_forever=True,repeat_while_visible=True,children=[click])
+        result=dict(found=True,box=(4,4,12,12),point=(10,10))
+        runner=self.runner()
+        runner.wait_image=Mock(return_value=result)
+        runner.confirm_target=Mock(return_value=None)
+        runner.probe=Mock(return_value=dict(found=False,status='not_found'))
+        runner.run()
+        self.assertEqual([call.args for call in self.output.call_args_list],[('text','C')])
+        self.assertIn(('state','완료'),[c.args for c in self.emit.call_args_list])
+
+    def test_temporary_uncertainty_keeps_continuous_workflow_running(self):
+        self.project['workflow_repeats']=0
+        self.first.update(wait_forever=True,repeat_while_visible=True)
+        runner=self.runner()
+        runner.sleep=Mock()
+        uncertain=dict(found=False,status='ambiguous',reason='temporary')
+        absent=dict(found=False,status='not_found')
+        runner.probe=Mock(side_effect=[uncertain]*25+[absent,absent])
+        def run_action(kind,text):
+            if text=='C':
+                runner.cancel.set()
+        self.output.side_effect=run_action
+        runner.run()
+        self.assertEqual([call.args[1] for call in self.output.call_args_list],['A','B','C'])
+        self.assertIn(('state','정지됨'),[c.args for c in self.emit.call_args_list])

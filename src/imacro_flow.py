@@ -190,11 +190,13 @@ class Workflow:
             self.results.clear()
             self.emit('workflow_iteration',(cycle,limit))
             self.execute_workflow_pass()
-            if (not limit or cycle<limit) and len(self.top_steps)==1:
-                first=self.top_steps[0]
+            enabled=[step for step in self.top_steps if step['enabled']]
+            if (not limit or cycle<limit) and self.p.get('repeat_on_reappear') and len(enabled)==1:
+                first=enabled[0]
                 found=self.results.get(first['id'])
                 if first['kind']=='image' and first['enabled'] and found and found[1]['found'] and not first.get('repeat_while_visible'):
                     result=found[1]
+                    self.emit('waiting',(first['id'],0,'rearm','첫 이미지가 사라진 뒤 다시 나타나면 실행합니다.'))
                     while result is not None:
                         result=self.verify_disappearance(first,result)
             if not limit or cycle<limit:

@@ -41,10 +41,25 @@ def capture(roi=None):
     from desktop_capture import capture_rectangle
     x,y,w,h=roi or bounds()
     try:
-        return capture_rectangle(x,y,w,h)
+        frame=capture_rectangle(x,y,w,h)
+        if frame.getbbox():
+            return frame
     except OSError:
         pass
-    return ImageGrab.grab(bbox=(x,y,x+w,y+h),all_screens=True)
+    return ImageGrab.grab(bbox=(x,y,x+w,y+h),all_screens=True,include_layered_windows=True)
+
+def capture_runtime(roi=None):
+    """Use a plain screen copy for continuous recognition."""
+    from desktop_capture import capture_rectangle
+
+    rect = roi or bounds()
+    try:
+        frame = capture_rectangle(*rect, include_layered=False)
+        if frame.getbbox():
+            return frame
+    except OSError:
+        pass
+    return capture(rect)
 
 def local_to_screen(point,roi=None):
     x,y,_,_=roi or bounds()
@@ -56,6 +71,8 @@ class Input:
         self.mouse=mouse.Controller();self.keys=keyboard.Controller();self.buttons=mouse.Button;self.Key=keyboard.Key
         self.held=set()
     def move_to(self,x,y):
+        if self.mouse.position==(x,y):
+            return
         user32=ctypes.WinDLL('user32',use_last_error=True)
         if not user32.SetCursorPos(x,y):
             raise RuntimeError(f'Windows에서 커서 이동 실패 (오류 {ctypes.get_last_error()})')

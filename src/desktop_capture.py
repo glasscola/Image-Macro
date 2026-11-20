@@ -38,7 +38,7 @@ def functions():
     return user, gdi
 
 
-def capture_rectangle(x, y, width, height):
+def capture_rectangle(x, y, width, height, *, include_layered=True):
     if width <= 0 or height <= 0:
         raise ValueError("캡처 크기가 올바르지 않습니다.")
     user, gdi = functions()
@@ -62,7 +62,10 @@ def capture_rectangle(x, y, width, height):
         if not previous or previous == ctypes.c_void_p(-1).value:
             previous = None
             raise ctypes.WinError(ctypes.get_last_error())
-        if not gdi.BitBlt(destination, 0, 0, width, height, source, x, y, 0x40CC0020):
+        raster_operation = 0x00CC0020  # SRCCOPY
+        if include_layered:
+            raster_operation |= 0x40000000  # CAPTUREBLT
+        if not gdi.BitBlt(destination, 0, 0, width, height, source, x, y, raster_operation):
             raise ctypes.WinError(ctypes.get_last_error())
         gdi.GdiFlush()
         pixels = ctypes.string_at(data, width * height * 4)

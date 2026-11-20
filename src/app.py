@@ -80,7 +80,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.build()
         self.hotkeys=keyboard.GlobalHotKeys({
             '<f7>':lambda:self.queue.put(('record_end_request',None)),
-            '<f10>':lambda:self.queue.put(('stop',None))})
+            '<f10>':lambda:self.queue.put(('stop','F10 단축키'))})
         self.hotkeys.start()
         self.after(30,self.poll)
         self.protocol('WM_DELETE_WINDOW',self.close)
@@ -304,6 +304,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         menu=tk.Menu(self,tearoff=False)
         menu.add_command(label='1회 실행',command=lambda:self.save_cycles(1))
         menu.add_command(label='계속 반복',command=lambda:self.save_cycles(0))
+        if sum(step['enabled'] for step in self.project['steps'])==1:
+            menu.add_command(label='계속 반복 · 이미지가 다시 나타날 때만',command=lambda:self.save_cycles(0,True))
         def custom():
             n=simpledialog.askinteger('전체 실행 횟수','마지막 카드까지 몇 번 실행할까요?',
                                        initialvalue=3,minvalue=1,maxvalue=100000,parent=self)
@@ -313,9 +315,10 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         menu.tk_popup(self.cycle_button.winfo_rootx(),
                       self.cycle_button.winfo_rooty()+self.cycle_button.winfo_height())
 
-    def save_cycles(self,count):
+    def save_cycles(self,count,reappear=False):
         self.snapshot()
         self.project['workflow_repeats']=count
+        self.project['repeat_on_reappear']=reappear
         self.render()
 
     def render_transition(self, step, next_step):
@@ -339,7 +342,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def update_header(self):
         count=self.project.get('workflow_repeats',1)
-        self.cycle_button.configure(text='전체 실행 · '+(f'{count}회' if count else '계속 반복'),
+        display=f'{count}회' if count else '재등장마다 반복' if self.project.get('repeat_on_reappear') else '계속 반복'
+        self.cycle_button.configure(text='전체 실행 · '+display,
                                     state='normal' if self.editable() else 'disabled')
         title=self.path.name.removesuffix('.imacro.json') if self.path else '새 작업'
         self.file_button.configure(text=title+('  •' if self.dirty else '')+'  ▾')
@@ -754,7 +758,34 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def capture_target(self,at=None,replace=None):
         if self.editable():
-            select_screen(self,'image',lambda im,roi:self.add_image(im,roi=roi,at=at,replace=replace))
+            select_screen(self,'image',lambda im,roi:self.confirm_capture(im,roi,at,replace))
+
+    def confirm_capture(self,image,roi,at,replace):
+        dialog=self.dialog('선택한 이미지 확인')
+        dialog.attributes('-topmost',True)
+        width,height=image.size
+        preview=image.copy()
+        preview.thumbnail((420,240))
+        if max(width,height)<96:
+            scale=min(4,192//max(width,height))
+            preview=preview.resize((width*scale,height*scale),Image.Resampling.NEAREST)
+        photo=ImageTk.PhotoImage(preview,master=dialog)
+        view=tk.Label(dialog,image=photo,bg=WHITE,padx=16,pady=10)
+        view.photo=photo
+        view.pack()
+        detail=f'실제 캡처 크기  {width} × {height} 픽셀'
+        if min(width,height)<24:
+            detail+='\n작은 대상입니다. 구별되는 테두리나 글자도 함께 선택하면 도움이 됩니다.'
+        tk.Label(dialog,text=detail,bg=WHITE,fg=INK,padx=16,pady=4,justify='left').pack(anchor='w')
+        controls=tk.Frame(dialog,bg=WHITE,padx=16,pady=12)
+        controls.pack(fill='x')
+        def confirm():
+            dialog.destroy()
+            self.add_image(image,roi=roi,at=at,replace=replace)
+        self.button(controls,'이 이미지 사용',confirm,True).pack(side='right')
+        self.button(controls,'취소',dialog.destroy).pack(side='right',padx=6)
+        dialog.bind('<Escape>',lambda _:dialog.destroy())
+        dialog.bind('<Return>',lambda _:confirm())
 
     def image_files(self,paths,at=None,replace=None):
         for path in paths:
@@ -1367,7 +1398,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='waiting':
             uid,seconds,status,reason=value
             labels={'capture_error':'화면 읽기 재시도','incomplete':'후보 확인 중','moved':'대상 위치 다시 확인',
-                    'ambiguous':'후보 여러 곳','insufficient':'구별할 특징 부족','disappearing':'사라짐 확인 중'}
+                    'ambiguous':'후보 여러 곳','insufficient':'구별할 특징 부족','disappearing':'사라짐 확인 중','rearm':'첫 이미지가 사라지길 기다리는 중',
+                    'target_unavailable':'대상 창 기다리는 중'}
             label=labels.get(status,'이미지 기다리는 중')
             detail=f'{label} · {seconds}초'
             self.set_state(uid,'running',detail)
@@ -1375,18 +1407,21 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             text=f'{self.cycle_caption}{self.stage_numbers[uid]}단계 · {name} · {detail}'
             self.status.configure(text=text if status=='not_found' else f'{text} · {reason}')
             if self.progress:
-                self.progress_label.configure(text=detail)
+                self.progress_label.configure(text=text)
         elif kind=='workflow_iteration':
             n,total=value
             self.cycle_caption=f'전체 {n}/{total}회 · ' if total else f'전체 {n}회차 · '
+            changed={self.visible_parent.get(uid,uid) for uid in self.states}
             self.states.clear()
-            for uid in self.rows:
+            for uid in changed.intersection(self.rows):
                 self.paint(uid)
         elif kind=='image_iteration':
             uid,iteration=value
             self.set_state(uid,'running',f'{iteration}회째 반복 중')
             self.log.append(f'{self.stage_numbers[uid]}단계 · {iteration}회째 반복 중')
         elif kind=='stop':
+            if self.runner and value:
+                self.log.append(f'{value} · 정지 요청')
             self.stop()
         elif kind=='record_row':
             self.record_row(*value)

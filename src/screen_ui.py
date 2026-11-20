@@ -8,6 +8,8 @@ from tkinter import messagebox
 
 from PIL import ImageTk
 import desktop
+from selection_capture import capture_visible_desktop
+from automation_errors import TargetUnavailable
 
 user = ctypes.windll.user32
 user.GetAncestor.argtypes = [win.HWND, win.UINT]
@@ -43,6 +45,10 @@ def executable(pid):
     finally:
         kernel.CloseHandle(handle)
 user.SetForegroundWindow.argtypes = [win.HWND]
+user.GetTopWindow.argtypes = [win.HWND]
+user.GetTopWindow.restype = win.HWND
+user.GetWindow.argtypes = [win.HWND, win.UINT]
+user.GetWindow.restype = win.HWND
 user.SetWindowDisplayAffinity.argtypes = [win.HWND, win.DWORD]
 user.SetWindowPos.argtypes = [win.HWND, win.HWND, ctypes.c_int, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, win.UINT]
@@ -115,9 +121,9 @@ def find_window(anchor):
                 raise RuntimeError(f'대상 창이 여러 개입니다 · 클릭 위치를 다시 지정하세요 · {anchor["title"]}')
             hwnd=candidates[0] if candidates else None
         if not hwnd:
-            raise RuntimeError(f'기록한 창을 열어 주세요 · {anchor["title"]}')
+            raise TargetUnavailable(f'기록한 창을 열어 주세요 · {anchor["title"]}')
     if not user.IsWindowVisible(hwnd):
-        raise RuntimeError(f'기록한 창을 화면에 표시해 주세요 · {anchor["title"]}')
+        raise TargetUnavailable(f'기록한 창을 화면에 표시해 주세요 · {anchor["title"]}')
     return hwnd
 
 
@@ -128,7 +134,7 @@ def focus_window(target):
     if user.GetForegroundWindow()!=hwnd:
         user.SetForegroundWindow(hwnd)
     if user.GetForegroundWindow()!=hwnd:
-        raise RuntimeError(f'기록한 창을 활성화해 주세요 · {target["title"]}')
+        raise TargetUnavailable(f'기록한 창을 활성화해 주세요 · {target["title"]}')
 
 
 def resolve(anchor,require_visible=True,*,activate=False):
@@ -146,10 +152,13 @@ def resolve(anchor,require_visible=True,*,activate=False):
     if not previous or not current or any(abs(after-max(1,before)*ratio)>max(3,before*.05)
                                            for before,after in zip(previous,current)):
         ratio=1
-    point=screen_point(round(anchor['dx']*ratio),round(anchor['dy']*ratio),hwnd)
+    try:
+        point=screen_point(round(anchor['dx']*ratio),round(anchor['dy']*ratio),hwnd)
+    except RuntimeError as error:
+        raise TargetUnavailable(str(error)) from error
     hit = pointer_window(*point)
     if require_visible and (not hit or hit['handle'] != hwnd):
-        raise RuntimeError(f'기록한 위치가 다른 창에 가려져 있습니다 · {anchor["title"]}')
+        raise TargetUnavailable(f'기록한 위치가 다른 창에 가려져 있습니다 · {anchor["title"]}')
     return point
 
 
@@ -161,29 +170,40 @@ def exclude(widget, value=True):
 
 def select_screen(app, mode, callback):
     app.withdraw()
+    app.update_idletasks()
 
     def start():
         try:
             x, y, w, h = desktop.bounds()
-            frame = desktop.capture()
+            ctypes.windll.dwmapi.DwmFlush()
+            displays = desktop.monitors()
+            frame = capture_visible_desktop((x, y, w, h), displays)
         except Exception as err:
             app.deiconify()
             messagebox.showerror('화면 선택', str(err), parent=app)
             return
         overlay = tk.Toplevel(app)
+        overlay.withdraw()
         overlay.overrideredirect(True)
         overlay.geometry(f'{w}x{h}+0+0')
         overlay.attributes('-topmost', True)
-        canvas = tk.Canvas(overlay, highlightthickness=0, cursor='cross')
+        overlay.configure(cursor='crosshair')
+        canvas = tk.Canvas(overlay, highlightthickness=0, cursor='crosshair')
         canvas.pack(fill='both', expand=True)
-        overlay.photo = ImageTk.PhotoImage(frame)
-        canvas.create_image(0, 0, image=overlay.photo, anchor='nw')
+        overlay.photos = []
+        for monitor in displays:
+            mx,my,mw,mh=monitor['rect']
+            left,top=mx-x,my-y
+            tile=frame.crop((left,top,left+mw,top+mh))
+            photo=ImageTk.PhotoImage(tile,master=overlay)
+            overlay.photos.append(photo)
+            canvas.create_image(left,top,image=photo,anchor='nw')
         msg = {'image':'이미지로 찾을 부분을 둘러싸세요',
                'point':'다시 누를 위치를 한 번 찍으세요',
                'drag':'시작점에서 끝점까지 끌어 놓으세요',
                'scroll':'대상 창 위에서 휠을 굴리세요. Enter로 적용'}[mode]
         mx, my = screen_point(0, 0)
-        display = next((m['rect'] for m in desktop.monitors()
+        display = next((m['rect'] for m in displays
                         if m['rect'][0] <= mx < m['rect'][0]+m['rect'][2]
                         and m['rect'][1] <= my < m['rect'][1]+m['rect'][3]), (x,y,w,h))
         left, top = display[0]-x, display[1]-y
@@ -191,7 +211,6 @@ def select_screen(app, mode, callback):
         canvas.create_text(left+32,top+39,text=msg+'   ·   Esc 취소',anchor='w',
                            fill='white',font=('맑은 고딕',12,'bold'))
         overlay.update_idletasks()
-        user.SetWindowPos(user.GetAncestor(overlay.winfo_id(),2),-1,x,y,w,h,0x0040)
         start_point = None
         marker = None
         drag_path = []
@@ -276,6 +295,41 @@ def select_screen(app, mode, callback):
             canvas.bind('<B1-Motion>',move)
             canvas.bind('<ButtonRelease-1>',finish)
         overlay.bind('<Escape>',lambda _:finish())
+        overlay.deiconify()
+        overlay.update_idletasks()
+        hwnd = user.GetAncestor(overlay.winfo_id(),2)
+        # Place above other always-on-top windows as well as normal windows.
+        if not hwnd or not user.SetWindowPos(hwnd,-1,x,y,w,h,0x0050):
+            overlay.destroy()
+            app.deiconify()
+            messagebox.showerror('화면 선택','선택창을 화면 맨 위에 표시할 수 없습니다.',parent=app)
+            return
+        user.SetForegroundWindow(hwnd)
         overlay.focus_force()
+        overlay.grab_set()
+
+        # New topmost windows can appear after selection begins. Only raise
+        # this overlay while its own modal grab is active; never take focus
+        # back from the user's other applications.
+        raise_timer = None
+
+        def keep_above():
+            nonlocal raise_timer
+            raise_timer = None
+            if overlay.grab_current() != overlay:
+                return
+            ahead=user.GetTopWindow(None)
+            while ahead and ahead!=hwnd and not user.IsWindowVisible(ahead):
+                ahead=user.GetWindow(ahead,2)
+            if ahead and ahead!=hwnd:
+                user.SetWindowPos(hwnd,-1,0,0,0,0,0x0013)
+            raise_timer = overlay.after(90,keep_above)
+
+        def stop_raising(event):
+            if event.widget == overlay and raise_timer is not None:
+                overlay.after_cancel(raise_timer)
+
+        overlay.bind('<Destroy>', stop_raising, add='+')
+        raise_timer = overlay.after(90,keep_above)
 
     app.after(100,start)
