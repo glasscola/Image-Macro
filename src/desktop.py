@@ -70,6 +70,7 @@ class Input:
         from pynput import mouse,keyboard
         self.mouse=mouse.Controller();self.keys=keyboard.Controller();self.buttons=mouse.Button;self.Key=keyboard.Key
         self.held=set()
+        self.held_buttons=set()
     def move_to(self,x,y):
         if self.mouse.position==(x,y):
             return
@@ -96,9 +97,15 @@ class Input:
                                     for state in states))
         user32=ctypes.WinDLL('user32',use_last_error=True)
         sent=user32.SendInput(len(states),items,ctypes.sizeof(Event))
+        if sent:
+            if states[sent-1]:
+                self.held_buttons.add(button)
+            else:
+                self.held_buttons.discard(button)
         if sent!=len(states):
             if sent and len(states)>1:
-                user32.SendInput(1,ctypes.byref(items[1]),ctypes.sizeof(Event))
+                if user32.SendInput(1,ctypes.byref(items[1]),ctypes.sizeof(Event)):
+                    self.held_buttons.discard(button)
             raise RuntimeError(f'Windows 클릭 입력 전달 실패 ({sent}/{len(states)})')
 
     def click_at(self,x,y,button):
@@ -123,4 +130,12 @@ class Input:
             try:self.keys.release(k)
             except Exception:pass
         self.held.clear()
-        for b in (self.buttons.left,self.buttons.right,self.buttons.middle):self.mouse.release(b)
+        first_error=None
+        for button in tuple(self.held_buttons):
+            try:
+                self.mouse_button(button,False)
+            except (OSError,RuntimeError) as error:
+                if first_error is None:
+                    first_error=error
+        if first_error is not None:
+            raise first_error

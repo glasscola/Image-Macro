@@ -380,10 +380,11 @@ class Runner(Workflow):
         if kind=='drag':
             x,y,x2,y2,duration=args
             self.wait_for_pointer_target(x,y)
-            inp.mouse.position=(x,y);inp.mouse.press(inp.buttons.left)
+            inp.mouse.position=(x,y)
+            inp.mouse_button(inp.buttons.left,True)
             try:
                 for i in range(1,61):self.sleep(duration/60);inp.mouse.position=(round(x+(x2-x)*i/60),round(y+(y2-y)*i/60))
-            finally:inp.mouse.release(inp.buttons.left)
+            finally:inp.mouse_button(inp.buttons.left,False)
             return
         if kind in ('key','hold'):
             keys=args[0].split('+')
