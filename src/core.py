@@ -186,10 +186,10 @@ class Runner(Workflow):
             x,y,w,h=roi
             frame=frame.crop((x-ox,y-oy,x-ox+w,y-oy+h))
         if min(frame.size)<2: raise CaptureError('화면 캡처 크기 오류')
-        if not frame.getbbox():
-            raise CaptureError('화면 판정 불가: 검은 화면')
         asset=self.p['images'][image or s['image']]
         template=self.templates[image or s['image']]
+        if (s['kind']=='condition' or template.silhouette is None) and not frame.getbbox():
+            raise CaptureError('화면 판정 불가: 검은 화면')
         source_dpi=asset.get('dpi')
         cancel=checkpoint or (lambda:self.check(False))
         if s.get('moving') and image is None:
@@ -271,6 +271,8 @@ class Runner(Workflow):
             left,top = s['roi'][:2] if s['roi'] else (0,0)
         sampled=time.monotonic()
         if not frame.getbbox():
+            if s['kind']!='condition' and self.templates[s['image']].silhouette is not None:
+                return None
             raise CaptureError('화면 판정 불가: 검은 화면')
         local = dict(previous,box=(x-left,y-top,w,h))
         if moving:
@@ -422,7 +424,12 @@ class Runner(Workflow):
                 if e.get('target') and (e['down'] or ('key',e['key']) not in self.gesture_held):
                     from screen_ui import focus_window
                     focus_window(e['target'])
-                inp.key(e['key'],e['down'])
+                if 'korean_mode' in e:
+                    from keyboard_ime import restore_korean_mode
+                    mode=e['korean_mode']
+                    if not restore_korean_mode(mode) and mode:
+                        raise RuntimeError('대상 창에서 한글 입력 모드를 사용할 수 없습니다.')
+                inp.key(f'vk:{e["vk"]}' if 'vk' in e else e['key'],e['down'])
             return
     def replay_events(self,events,step_id=None):
         try:

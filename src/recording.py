@@ -6,12 +6,15 @@ import time
 from pynput import keyboard, mouse
 from screen_ui import attach, executable, pointer_window, user, window_info
 from desktop import capture, MOUSE_BUTTON_LABELS
+from keyboard_ime import VK_HANGUL, korean_mode
 
 RESERVED = {'f7','f10'}
 DESKTOP_WINDOWS = {'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}
 
 
 def key_name(key):
+    if getattr(key,'vk',None) == VK_HANGUL:
+        return f'vk:{VK_HANGUL}'
     name = getattr(key, 'name', None)
     if name:
         return name
@@ -82,12 +85,21 @@ class Recorder:
                 if token in self.held or (window and window['pid']==os.getpid()):
                     return
                 self.flush_path()
-                self.held[token] = (time.monotonic(),name)
+                mode = (korean_mode() if not self.events and window
+                        and window.get('kind') not in DESKTOP_WINDOWS else None)
+                # Preserve physical letters even if the layout translated them.
+                vk = getattr(key,'vk',None)
+                physical = vk if vk is not None and 65 <= vk <= 90 else None
+                self.held[token] = (time.monotonic(),name,physical)
             elif token not in self.held:
                 return
             now = time.monotonic()
-            started,saved_name = self.held[token]
+            started,saved_name,physical = self.held[token]
             event=dict(type='key',key=saved_name,down=down)
+            if physical is not None:
+                event['vk']=physical
+            if down and mode is not None:
+                event['korean_mode']=mode
             if (down and not self.events and window and window.get('title')
                     and window.get('kind') not in DESKTOP_WINDOWS):
                 event['target']=window
@@ -95,9 +107,12 @@ class Recorder:
             if not down:
                 del self.held[token]
                 names = list(dict.fromkeys(e['key'] for e in self.events if e['type']=='key'))
-                display = ' + '.join(n.replace('_l','').replace('_r','').title() for n in names)
+                display = ' + '.join('한/영' if n==f'vk:{VK_HANGUL}' else
+                                     n.replace('_l','').replace('_r','').title() for n in names)
                 if len(names)==1 and now-started>=.45:
                     display += f' · {now-started:.1f}초 누름'
+                if self.events[0].get('korean_mode') and display!='한/영':
+                    display = '한글 · '+display
                 self.flush(display,window=window)
 
     def click(self,x,y,button,down):

@@ -21,6 +21,7 @@ class RecordingKeyboardTests(unittest.TestCase):
             patch('recording.mouse.Listener'),
             patch('recording.user.GetForegroundWindow'),
             patch('recording.window_info', return_value=target),
+            patch('recording.korean_mode', return_value=None),
             patch('recording.os.getpid', return_value=101),
         ):
             recorder = Recorder(emit)
@@ -33,6 +34,27 @@ class RecordingKeyboardTests(unittest.TestCase):
         self.assertEqual([(event['key'], event['down']) for event in events],
                          [('a', True), ('a', False)])
         self.assertEqual(events[0]['target'], target)
+
+    def test_korean_mode_and_physical_letter_are_saved(self):
+        target = {'pid': 202, 'title': 'Keyboard test'}
+        key = SimpleNamespace(char='g', vk=71)
+        with (
+            patch('recording.keyboard.Listener'),
+            patch('recording.mouse.Listener'),
+            patch('recording.user.GetForegroundWindow'),
+            patch('recording.window_info', return_value=target),
+            patch('recording.korean_mode', return_value=True),
+            patch('recording.os.getpid', return_value=101),
+        ):
+            emit = Mock()
+            recorder = Recorder(emit)
+            recorder.key(key, True)
+            recorder.key(key, False)
+        label, events, _, _ = emit.call_args.args
+        self.assertEqual(label,'한글 · G')
+        self.assertIs(events[0]['korean_mode'],True)
+        self.assertEqual([event['vk'] for event in events],[71,71])
+        self.assertNotIn('korean_mode',events[1])
 
     def test_desktop_and_missing_foreground_record_keys_without_window_binding(self):
         desktop = {'pid': 202, 'title': 'Program Manager', 'kind': 'Progman'}

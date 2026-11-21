@@ -191,6 +191,36 @@ def wide_candidates(screen,model,threshold,check):
     return found
 
 
+def quick_scaled_candidates(screen,model,scales,threshold,check):
+    """Propose common scales cheaply and verify them in the original pixels."""
+    from recognition_verify import verify
+
+    if screen.gray.size>=500_000:
+        factor=8 if min(model.width,model.height)>=104 else 4
+    else:
+        factor=2
+    limit = max(.94,threshold)
+    coarse = screen.coarse_gray(factor)
+    found, limited = [], False
+    sizes = dict.fromkeys((round(model.width*s),round(model.height*s)) for s in scales)
+    for w,h in sizes:
+        check()
+        if (w,h)==(model.width,model.height):
+            continue
+        cw,ch=w//factor,h//factor
+        if min(cw,ch)<6 or cw>coarse.shape[1] or ch>coarse.shape[0]:
+            continue
+        pixels,gray=model.variant(w,h)
+        needle=cv2.resize(gray,(cw,ch),interpolation=cv2.INTER_AREA)
+        coords,pending=peaks(response(coarse,needle),cw,ch,.81,5,check)
+        limited |= pending
+        for x,y in coords:
+            hit=verify(screen,pixels,gray,x*factor,y*factor,factor+2,limit,True)
+            if hit is not None and hit[0]>=limit:
+                found.append((hit[0],hit[1],hit[2],w,h))
+    return found, limited
+
+
 def small_size_candidates(screen,model,threshold,check):
     """A few common display ratios whose rounded dimensions matter on icons."""
     if not 10<=min(model.width,model.height)<24:
@@ -225,30 +255,10 @@ def exact_anchors(frame,model,check,budget=1,*,maximum=80, candidate_limit=800):
     rows,cols=pixels.shape[0]-h+1,pixels.shape[1]-w+1
     if rows<=0 or cols<=0:
         return [],False
-    flat=model.pixels.reshape(-1,3).astype(np.int16)
-    center=np.median(flat[::max(1,len(flat)//2048)],axis=0)
-    coordinates=[]
-    for area in np.array_split(np.arange(h),3):
-        zone=flat[area[0]*w:(area[-1]+1)*w]
-        stride=max(1,len(zone)//12000)
-        best=int(np.argmax(np.abs(zone[::stride]-center).max(axis=1)))*stride+area[0]*w
-        coordinates.append(divmod(best,w))
+    anchors=model.anchor_colors if candidate_limit<800 else model.anchor_colors[:3]
     grid=None
-    if candidate_limit<800 and min(h,w)>=24:
-        # Color extremes can repeat across monochrome illustrations. Use
-        # additional points along structure to narrow dense candidate maps.
-        gray=model.gray
-        edges=cv2.Laplacian(gray,cv2.CV_16S)
-        for ys in np.array_split(np.arange(h),3):
-            for xs in np.array_split(np.arange(w),2):
-                grad=np.abs(edges[ys[0]:ys[-1]+1,xs[0]:xs[-1]+1])
-                at_y,at_x=np.unravel_index(np.argmax(grad),grad.shape)
-                coordinates.append((ys[0]+at_y,xs[0]+at_x))
-    for i,(y,x) in enumerate(coordinates):
+    for i,(y,x,low,high) in enumerate(anchors):
         check()
-        color=model.pixels[y,x].astype(np.int16)
-        low=np.maximum(0,color-4).astype(np.uint8)
-        high=np.minimum(255,color+4).astype(np.uint8)
         allowed=cv2.inRange(pixels[y:y+rows,x:x+cols],low,high)
         grid=allowed if grid is None else cv2.bitwise_and(grid,allowed)
         remaining=cv2.countNonZero(grid)
