@@ -5,19 +5,23 @@ import time
 
 from pynput import keyboard, mouse
 from screen_ui import attach, executable, pointer_window, user, window_info
-from desktop import capture
+from desktop import capture, MOUSE_BUTTON_LABELS
 
 RESERVED = {'f7','f10'}
-LABELS = {'left':'왼쪽','right':'오른쪽','middle':'가운데'}
+DESKTOP_WINDOWS = {'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}
 
 
 def key_name(key):
-    if hasattr(key,'name'):
-        return key.name
-    char = key.char
-    if char and 1 <= ord(char) <= 26:
-        return chr(ord(char)+96)
-    return char or (f'vk:{key.vk}' if key.vk is not None else None)
+    name = getattr(key, 'name', None)
+    if name:
+        return name
+    char = getattr(key, 'char', None)
+    if char and len(char) == 1:
+        if 1 <= ord(char) <= 26:
+            return chr(ord(char) + 96)
+        return char
+    vk = getattr(key, 'vk', None)
+    return f'vk:{vk}' if vk is not None else None
 
 
 class Recorder:
@@ -75,7 +79,7 @@ class Recorder:
             token = ('key',getattr(key,'vk',None) or name)
             window = window_info(user.GetForegroundWindow())
             if down:
-                if token in self.held or not window or window['pid']==os.getpid():
+                if token in self.held or (window and window['pid']==os.getpid()):
                     return
                 self.flush_path()
                 self.held[token] = (time.monotonic(),name)
@@ -84,7 +88,8 @@ class Recorder:
             now = time.monotonic()
             started,saved_name = self.held[token]
             event=dict(type='key',key=saved_name,down=down)
-            if down and not self.events and window.get('title'):
+            if (down and not self.events and window and window.get('title')
+                    and window.get('kind') not in DESKTOP_WINDOWS):
                 event['target']=window
             self.step(event,now)
             if not down:
@@ -97,7 +102,7 @@ class Recorder:
 
     def click(self,x,y,button,down):
         name = button.name
-        if name not in LABELS:
+        if name not in MOUSE_BUTTON_LABELS:
             return
         with self.lock:
             token = ('mouse',name)
@@ -105,15 +110,19 @@ class Recorder:
                 return
             if down:
                 window = pointer_window(x,y)
-                if not window or window['pid']==os.getpid():
+                if window and window['pid']==os.getpid():
                     return
                 self.flush_path()
-                window['exe']=executable(window['pid'])
+                anchor=None
+                if window and window.get('kind') not in DESKTOP_WINDOWS:
+                    window['exe']=executable(window['pid'])
+                    anchor=attach((x,y),window)
                 try:
                     preview = capture((int(x)-50,int(y)-30,100,60))
                 except OSError:
                     preview = None
-                self.held[token] = (x,y,window,preview,attach((x,y),window))
+                self.last_move = 0
+                self.held[token] = (x,y,window,preview,anchor)
             elif token not in self.held:
                 return
             ox,oy,window,preview,start_anchor = self.held[token]
@@ -123,7 +132,7 @@ class Recorder:
             self.step(event,time.monotonic())
             if not down:
                 del self.held[token]
-                label='드래그' if abs(x-ox)+abs(y-oy)>5 or any(e['type']=='move' for e in self.events) else LABELS[name]+' 클릭'
+                label='드래그' if abs(x-ox)+abs(y-oy)>5 or any(e['type']=='move' for e in self.events) else MOUSE_BUTTON_LABELS[name]+' 클릭'
                 self.flush(label,preview,window)
 
     def move(self,x,y):
@@ -148,12 +157,11 @@ class Recorder:
                 return
             if self.path and (now-self.last>.20 or len(self.path)>=300):
                 self.flush_path()
-            if self.path and now-self.last_move<.012:
+            if len(self.path)>1 and now-self.last_move<.012:
                 # Keep the newest end point while limiting samples per second.
                 prior=self.path[-1]['delay']
-                if len(self.path)>1:
-                    self.path[-1]=dict(event,delay=prior+now-self.last)
-                    self.last=now
+                self.path[-1]=dict(event,delay=prior+now-self.last)
+                self.last=now
                 return
             self.last_move=now
             if self.held:
@@ -167,8 +175,9 @@ class Recorder:
     def scroll(self,x,y,dx,dy):
         with self.lock:
             window = pointer_window(x,y)
-            if self.active and window and window['pid']!=os.getpid():
+            if self.active and (not window or window['pid']!=os.getpid()):
                 self.flush_path()
+                anchor=attach((x,y),window) if window and window.get('kind') not in DESKTOP_WINDOWS else None
                 self.step(dict(type='scroll',dx=int(dx),dy=int(dy),x=int(x),y=int(y),
-                               anchor=attach((x,y),window)),time.monotonic())
+                               anchor=anchor),time.monotonic())
                 self.flush('아래로 스크롤' if dy<0 else '위로 스크롤' if dy else '가로 스크롤',window=window)

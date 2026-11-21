@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image, ImageGrab
 from imacro_flow import Workflow, Jump, validate_flow
 from automation_errors import TargetUnavailable
+from desktop import MOUSE_BUTTON_LABELS
 
 KINDS = {'image':'이미지 작업','text':'글자 입력','scroll':'스크롤','hold':'키 누르고 있기','wait':'이미지 기다리기', 'find':'이미지 찾기', 'click':'찾은 위치 클릭',
  'point':'좌표 클릭', 'drag':'드래그', 'key':'키 입력', 'delay':'시간 대기',
@@ -84,7 +85,7 @@ def validate(p,ready=True):
             if len(s['offset'])!=2: raise ValueError('클릭 위치 오류')
             for v in s['offset']: number(v,0,1)
             if s['image_mode'] not in ('wait','once') or s['image_action'] not in ('click','actions'):raise ValueError('이미지 동작 설정 오류')
-            if s['button'] not in ('left','right','middle'):raise ValueError('마우스 버튼 오류')
+            if s['button'] not in MOUSE_BUTTON_LABELS:raise ValueError('마우스 버튼 오류')
             number(s['clicks'],1,100);number(s['interval'],0,60)
             if ready and s['kind'] in ('image','wait','find','condition') and s['enabled'] and s['image'] not in p['images']: raise ValueError(s['name']+': 이미지를 선택하세요.')
             if ready and s['kind']=='click' and not s['source']: raise ValueError('클릭할 인식 단계를 연결하세요.')

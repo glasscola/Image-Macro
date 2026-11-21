@@ -11,17 +11,19 @@ class MouseCleanupTests(unittest.TestCase):
         self.input = Input.__new__(Input)
         self.input.mouse = Mock()
         self.input.keys = Mock()
-        self.input.buttons = SimpleNamespace(left='left', right='right', middle='middle')
+        self.input.buttons = SimpleNamespace(left='left', right='right', middle='middle', x1='x1', x2='x2')
         self.input.held = set()
         self.input.held_buttons = set()
         self.input.move_to = Mock()
         self.flags = []
+        self.mouse_data = []
         self.api = Mock()
 
         def send(count, events, _size):
             if hasattr(events, '_obj'):
                 events = [events._obj]
             self.flags.extend(events[index].mouse.flags for index in range(count))
+            self.mouse_data.extend(events[index].mouse.data for index in range(count))
             return count
 
         self.api.SendInput.side_effect = send
@@ -39,6 +41,14 @@ class MouseCleanupTests(unittest.TestCase):
         self.input.click_at(20, 30, 'right')
         self.input.release()
         self.assertEqual(self.flags, [8, 16])
+
+    def test_side_buttons_use_distinct_windows_codes(self):
+        for button in ('x1', 'x2'):
+            self.input.mouse_button(button, True)
+            self.input.mouse_button(button, False)
+        self.input.release()
+        self.assertEqual(self.flags, [128, 256, 128, 256])
+        self.assertEqual(self.mouse_data, [1, 1, 2, 2])
 
     def test_interrupted_recording_releases_only_its_held_button(self):
         runner = core.Runner(core.project(), Mock())

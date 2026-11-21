@@ -2,6 +2,11 @@
 import ctypes
 from PIL import ImageGrab
 
+MOUSE_BUTTON_LABELS = {
+    'left': '왼쪽', 'right': '오른쪽', 'middle': '가운데',
+    'x1': '뒤로 버튼', 'x2': '앞으로 버튼',
+}
+
 def monitors():
     """Enumerate physical display rectangles and effective DPI on the calling thread."""
     from ctypes import wintypes as w
@@ -91,9 +96,10 @@ class Input:
         class Event(ctypes.Structure):
             _fields_=[('kind',w.DWORD),('mouse',MouseInput)]
 
-        down,up={self.buttons.left:(2,4),self.buttons.right:(8,16),
-                 self.buttons.middle:(32,64)}[button]
-        items=(Event*len(states))(*(Event(0,MouseInput(0,0,0,down if state else up,0,0))
+        down,up,data={self.buttons.left:(2,4,0),self.buttons.right:(8,16,0),
+                      self.buttons.middle:(32,64,0),self.buttons.x1:(128,256,1),
+                      self.buttons.x2:(128,256,2)}[button]
+        items=(Event*len(states))(*(Event(0,MouseInput(0,0,data,down if state else up,0,0))
                                     for state in states))
         user32=ctypes.WinDLL('user32',use_last_error=True)
         sent=user32.SendInput(len(states),items,ctypes.sizeof(Event))

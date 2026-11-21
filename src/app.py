@@ -416,7 +416,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             title='찾은 이미지 클릭'
             origin=self.locate(s['source'])
             image=self.project['images'].get(origin[2]['image'],{}) if origin else {}
-            desc=image.get('name','원본 단계 확인')+' · '+{'left':'왼쪽','right':'오른쪽','middle':'가운데'}[s['button']]+f' {s["clicks"]}회'
+            desc=image.get('name','원본 단계 확인')+' · '+desktop.MOUSE_BUTTON_LABELS[s['button']]+f' {s["clicks"]}회'
         elif kind=='delay':
             title=f'{s["seconds"]:g}초 대기'
         elif kind in ('condition','wait','find'):
@@ -1050,7 +1050,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         interval=tk.StringVar(value=str(step['interval']))
         row=tk.Frame(panel,bg=WHITE)
         row.pack(anchor='w',pady=10)
-        for key,label in [('left','왼쪽'),('right','오른쪽'),('middle','가운데')]:
+        for key,label in desktop.MOUSE_BUTTON_LABELS.items():
             tk.Radiobutton(row,text=label,value=key,variable=choice,bg=WHITE).pack(side='left')
         for label,value in [(' 클릭 횟수',times),(' 간격(초)',interval)]:
             tk.Label(row,text=label,bg=WHITE).pack(side='left')
@@ -1304,9 +1304,11 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.record_overlay=tk.Toplevel(self)
         self.record_overlay.title('Image Macro 녹화 중')
         self.record_overlay.attributes('-topmost',True)
-        self.record_overlay.geometry('410x90+18+18')
+        self.record_overlay.geometry('430x116+18+18')
         self.record_overlay.configure(bg=WHITE,padx=12,pady=9)
         tk.Label(self.record_overlay,text=f'●  {dest} · 녹화 중',bg=WHITE,fg='#9d2740').pack(anchor='w')
+        tk.Label(self.record_overlay,text='입력할 창이나 바탕화면을 선택한 뒤 키를 누르세요.',
+                 bg=WHITE,fg='#344054').pack(anchor='w')
         self.button(self.record_overlay,'녹화 끝내기 · F7',self.toggle_record).pack(anchor='e',pady=(4,0))
         self.record_overlay.protocol('WM_DELETE_WINDOW',self.toggle_record)
         self.iconify()
