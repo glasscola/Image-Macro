@@ -66,6 +66,7 @@ class RecordingKeyboardTests(unittest.TestCase):
                 patch('recording.mouse.Listener'),
                 patch('recording.user.GetForegroundWindow'),
                 patch('recording.window_info', return_value=foreground),
+                patch('recording.korean_mode', return_value=True),
             ):
                 emit = Mock()
                 recorder = Recorder(emit)
@@ -75,6 +76,10 @@ class RecordingKeyboardTests(unittest.TestCase):
                 self.assertEqual([(event['key'], event['down']) for event in events],
                                  [('a', True), ('a', False)])
                 self.assertNotIn('target', events[0])
+                if foreground is None:
+                    self.assertNotIn('korean_mode', events[0])
+                else:
+                    self.assertIs(events[0]['korean_mode'], True)
 
     def test_desktop_records_chords_mixed_actions_and_mouse_paths(self):
         with (

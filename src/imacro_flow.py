@@ -58,6 +58,7 @@ class Workflow:
 
     def watch_routes(self):
         sweep=0
+        next_error_log=0.
         while not self.watch_stop.is_set() and not self.cancel.is_set():
             if not self.paused.is_set():
                 started=time.monotonic()
@@ -67,8 +68,9 @@ class Workflow:
                 except InterruptedError:
                     pass
                 except Exception as error:
-                    if not self.watch_stop.is_set() and not self.cancel.is_set():
+                    if started>=next_error_log and not self.watch_stop.is_set() and not self.cancel.is_set():
                         self.emit('log',f'이미지 감시 재시도 · {error}')
+                        next_error_log=started+5
                 sweep+=1
                 self.watch_stop.wait(max(.012,.08-(time.monotonic()-started)))
             else:

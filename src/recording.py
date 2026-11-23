@@ -85,8 +85,7 @@ class Recorder:
                 if token in self.held or (window and window['pid']==os.getpid()):
                     return
                 self.flush_path()
-                mode = (korean_mode() if not self.events and window
-                        and window.get('kind') not in DESKTOP_WINDOWS else None)
+                mode = korean_mode() if not self.events and window else None
                 # Preserve physical letters even if the layout translated them.
                 vk = getattr(key,'vk',None)
                 physical = vk if vk is not None and 65 <= vk <= 90 else None

@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import uuid
@@ -48,7 +49,8 @@ COLORS={'running':('#eaf0ff',BLUE),'done':('#e9faf2','#166a50'),
 class App(WorkflowEditor,TkinterDnD.Tk):
     def __init__(self,path=None):
         super().__init__()
-        self.title('Image Macro')
+        self.title('Image Macro v42')
+        self.destroying=False
         icon = Path(__file__).with_name('image-macro.ico')
         self.collapsed = set()
         self.picker = None
@@ -122,7 +124,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             pass
         else:
             tk.Label(bar,image=self.brand_icon,bg=WHITE).pack(side='left',padx=(0,9))
-        tk.Label(bar,text='Image Macro',font=('Segoe UI',19,'bold'),bg=WHITE,fg=INK).pack(side='left')
+        tk.Label(bar,text='Image Macro v42',font=('Segoe UI',19,'bold'),bg=WHITE,fg=INK).pack(side='left')
         self.file_button=self.button(bar,'새 작업  ▾',self.file_menu)
         self.file_button.pack(side='left',padx=18)
         self.run_button=self.button(bar,'▶  실행',self.run,True)
@@ -282,9 +284,19 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.after(80,self.close)
             return
         if self.abandon():
-            if self.hotkeys is not None:
-                self.hotkeys.stop()
             self.destroy()
+
+    def destroy(self):
+        if self.destroying:
+            return
+        self.destroying=True
+        # Disarm this interpreter's timers before widgets delete their Tcl commands.
+        # Each widget still owns the cleanup of its registered commands.
+        for job in self.tk.splitlist(self.tk.call('after','info')):
+            self.tk.call('after','cancel',job)
+        if self.hotkeys is not None:
+            self.hotkeys.stop()
+        super().destroy()
 
     def update_capture_exclusion(self,enabled):
         try:
@@ -395,6 +407,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             wait='계속 기다림' if s.get('wait_forever') else f'최대 {s["timeout"]:g}초'
             if s['image_mode']=='once':
                 wait='한 번 확인'
+            if core.repeat_waits_for_image(s,self.project.get('workflow_repeats',1)==0):
+                wait='반복 중 · 나타날 때까지 대기'
             desc=wait
             if s['id'] in self.collapsed:
                 desc+=f' · 행동 {len(s["children"])+len(s["otherwise"])}개 접힘'
@@ -1356,6 +1370,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.current=None
         self.log=[]
         self.diagnostics.pack(side='right',padx=12)
+        self.last_wait_state=None
+        self.last_completed_step=None
         self.last_error=''
         self.run_status='시작 중'
         self.cycle_caption=''
@@ -1453,6 +1469,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.set_state(uid,'running',detail)
             name=self.caption(self.locate(uid)[2])[0]
             text=f'{self.cycle_caption}{self.stage_numbers[uid]}단계 · {name} · {detail}'
+            if self.last_wait_state!=(uid,status):
+                self.last_wait_state=(uid,status)
+                self.event('log',f'{self.cycle_caption}{self.stage_numbers[uid]}단계 · {name} · {label} · {reason}')
             self.status.configure(text=text if status=='not_found' else f'{text} · {reason}')
         elif kind=='workflow_iteration':
             n,total=value
@@ -1470,10 +1489,11 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='record_row':
             self.record_row(*value)
         elif kind=='log':
-            self.log.append(value)
+            self.log.append(f'[{time.strftime("%H:%M:%S")}] {value}')
             if len(self.log)>2000:
                 del self.log[:500]
         elif kind=='active':
+            self.last_wait_state=None
             self.current=value
             s=self.locate(value)[2]
             detail='이미지 찾는 중' if s['kind'] in ('image','find','wait','condition') else '실행 중'
@@ -1487,6 +1507,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 if y<self.canvas.canvasy(0) or y+row.winfo_height()>self.canvas.canvasy(self.canvas.winfo_height()):
                     self.canvas.yview_moveto(y/max(1,self.list.winfo_height()))
         elif kind=='step_done':
+            self.last_completed_step=(time.strftime('%H:%M:%S'),self.stage_numbers[value],
+                                      self.caption(self.locate(value)[2])[0])
             self.set_state(value,'done','✓ 완료')
         elif kind=='step_error':
             uid,error=value
@@ -1506,6 +1528,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='state':
             self.run_status=value
         elif kind=='done':
+            completed=self.last_completed_step
+            detail=f' · 마지막 성공 {completed[0]} · {completed[1]}단계 {completed[2]}' if completed else ''
+            self.event('log',f'{self.cycle_caption}실행 종료 · {self.run_status}{detail}')
             self.last_runner=self.runner
             self.runner=None
             self.update_capture_exclusion(False)
@@ -1530,7 +1555,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                     break
                 self.event(kind,value)
         finally:
-            self.after(30,self.poll)
+            if not self.destroying:
+                self.after(30,self.poll)
 
     def show_frame(self):
         runner=self.runner or getattr(self,'last_runner',None)

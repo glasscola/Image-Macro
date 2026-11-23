@@ -1,33 +1,60 @@
 """Physical virtual-desktop coordinates, including negative monitor origins."""
 import ctypes
+from ctypes import wintypes as win
+from functools import lru_cache
 from PIL import ImageGrab
+from automation_errors import CaptureError, PointerMoved
 
 MOUSE_BUTTON_LABELS = {
     'left': '왼쪽', 'right': '오른쪽', 'middle': '가운데',
     'x1': '뒤로 버튼', 'x2': '앞으로 버튼',
 }
 
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [('size', win.DWORD), ('rect', win.RECT), ('work', win.RECT),
+                ('flags', win.DWORD), ('device', win.WCHAR * 32)]
+
+
+@lru_cache(maxsize=1)
+def _monitor_api():
+    # All recognition threads must use the same ctypes pointer types.
+    callback = ctypes.WINFUNCTYPE(win.BOOL, win.HANDLE, win.HDC,
+                                  ctypes.POINTER(win.RECT), win.LPARAM)
+    user = ctypes.WinDLL('user32')
+    enum = user.EnumDisplayMonitors
+    enum.argtypes = [win.HDC, ctypes.POINTER(win.RECT), callback, win.LPARAM]
+    enum.restype = win.BOOL
+    info = user.GetMonitorInfoW
+    info.argtypes = [win.HANDLE, ctypes.POINTER(_MonitorInfo)]
+    info.restype = win.BOOL
+    dpi = ctypes.WinDLL('shcore').GetDpiForMonitor
+    dpi.argtypes = [win.HANDLE, ctypes.c_int, ctypes.POINTER(win.UINT), ctypes.POINTER(win.UINT)]
+    dpi.restype = win.LONG
+    return callback, enum, info, dpi
+
+
 def monitors():
-    """Enumerate physical display rectangles and effective DPI on the calling thread."""
-    from ctypes import wintypes as w
-    class Rect(ctypes.Structure):
-        _fields_=[('left',w.LONG),('top',w.LONG),('right',w.LONG),('bottom',w.LONG)]
-    class Info(ctypes.Structure):
-        _fields_=[('size',w.DWORD),('rect',Rect),('work',Rect),('flags',w.DWORD),('device',w.WCHAR*32)]
-    u=ctypes.windll.user32
-    u.GetMonitorInfoW.argtypes=[w.HANDLE,ctypes.POINTER(Info)]
-    dpi=ctypes.windll.shcore.GetDpiForMonitor
-    dpi.argtypes=[w.HANDLE,ctypes.c_int,ctypes.POINTER(w.UINT),ctypes.POINTER(w.UINT)]
-    items=[]
-    callback=ctypes.WINFUNCTYPE(w.BOOL,w.HANDLE,w.HDC,ctypes.POINTER(Rect),w.LPARAM)
-    def visit(handle,dc,rect,param):
-        info=Info();info.size=ctypes.sizeof(info)
-        if not u.GetMonitorInfoW(handle,ctypes.byref(info)):return True
-        dx=w.UINT(96);dy=w.UINT(96);dpi(handle,0,ctypes.byref(dx),ctypes.byref(dy))
-        r=info.rect
-        items.append(dict(device=info.device,rect=[r.left,r.top,r.right-r.left,r.bottom-r.top],dpi=dx.value or 96))
+    """Read a complete, fresh display layout for this frame."""
+    callback, enum, get_info, get_dpi = _monitor_api()
+    items = []
+    info_failed = False
+
+    @callback
+    def visit(handle, dc, rect, param):
+        nonlocal info_failed
+        info = _MonitorInfo(size=ctypes.sizeof(_MonitorInfo))
+        if not get_info(handle, ctypes.byref(info)):
+            info_failed = True
+            return False
+        dx, dy = win.UINT(), win.UINT()
+        status = get_dpi(handle, 0, ctypes.byref(dx), ctypes.byref(dy))
+        r = info.rect
+        items.append(dict(device=info.device, rect=[r.left, r.top, r.right-r.left, r.bottom-r.top],
+                          dpi=dx.value if status == 0 and dx.value else 96))
         return True
-    if not u.EnumDisplayMonitors(None,None,callback(visit),0):raise RuntimeError('모니터 목록 조회 실패')
+
+    if not enum(None, None, visit, 0) or info_failed or not items:
+        raise CaptureError('모니터 목록을 읽을 수 없습니다.')
     return items
 
 def capture_metadata(roi):
@@ -84,7 +111,7 @@ class Input:
             raise RuntimeError(f'Windows에서 커서 이동 실패 (오류 {ctypes.get_last_error()})')
         current=self.mouse.position
         if current!=(x,y):
-            raise RuntimeError(f'마우스 이동 실패 · 요청 {(x,y)}, 실제 {current}')
+            raise PointerMoved(f'마우스 위치 변경 · 요청 {(x,y)}, 실제 {current}')
 
     def _button_events(self,button,states):
         from ctypes import wintypes as w

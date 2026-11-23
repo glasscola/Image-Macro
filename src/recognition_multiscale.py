@@ -194,19 +194,22 @@ def wide_candidates(screen,model,threshold,check):
 def quick_scaled_candidates(screen,model,scales,threshold,check):
     """Propose common scales cheaply and verify them in the original pixels."""
     from recognition_verify import verify
+    from recognition_silhouette import verify_silhouette
 
-    if screen.gray.size>=500_000:
-        factor=8 if min(model.width,model.height)>=104 else 4
-    else:
-        factor=2
     limit = max(.94,threshold)
-    coarse = screen.coarse_gray(factor)
     found, limited = [], False
     sizes = dict.fromkeys((round(model.width*s),round(model.height*s)) for s in scales)
     for w,h in sizes:
         check()
         if (w,h)==(model.width,model.height):
             continue
+        preferred = 8 if min(w,h)>=104 else 4
+        factor = preferred if screen.gray.size>=500_000 else 2
+        if min(w,h)<6*factor:
+            factor=2
+        if min(w,h)<12:
+            continue
+        coarse = screen.coarse_gray(factor)
         cw,ch=w//factor,h//factor
         if min(cw,ch)<6 or cw>coarse.shape[1] or ch>coarse.shape[0]:
             continue
@@ -216,8 +219,19 @@ def quick_scaled_candidates(screen,model,scales,threshold,check):
         limited |= pending
         for x,y in coords:
             hit=verify(screen,pixels,gray,x*factor,y*factor,factor+2,limit,True)
-            if hit is not None and hit[0]>=limit:
-                found.append((hit[0],hit[1],hit[2],w,h))
+            if hit is None:
+                continue
+            score,left,top = hit
+            if score<limit and score>=threshold and model.silhouette is not None:
+                # A short, reduced label can lose a pixel at a stroke edge.
+                # Require independent agreement of the foreground shape.
+                patch = screen.pixels[top:top+h,left:left+w]
+                ratio = min(w/model.width,h/model.height)
+                shape = verify_silhouette(patch,model.silhouette,threshold,ratio*.89,ratio*1.11)
+                if shape is not None:
+                    score = min(limit,max(score,shape[0]))
+            if score>=limit:
+                found.append((score,left,top,w,h))
     return found, limited
 
 
@@ -255,16 +269,16 @@ def exact_anchors(frame,model,check,budget=1,*,maximum=80, candidate_limit=800):
     rows,cols=pixels.shape[0]-h+1,pixels.shape[1]-w+1
     if rows<=0 or cols<=0:
         return [],False
-    anchors=model.anchor_colors if candidate_limit<800 else model.anchor_colors[:3]
+    anchors=model.anchor_colors
     grid=None
-    for i,(y,x,low,high) in enumerate(anchors):
+    for y,x,low,high in anchors:
         check()
         allowed=cv2.inRange(pixels[y:y+rows,x:x+cols],low,high)
         grid=allowed if grid is None else cv2.bitwise_and(grid,allowed)
         remaining=cv2.countNonZero(grid)
         if not remaining:
             return [],False
-        if i>=2 and remaining<=candidate_limit*budget:
+        if remaining<=min(8,candidate_limit*budget):
             break
     expected=cv2.countNonZero(grid)
     if expected>candidate_limit*budget:
@@ -278,6 +292,24 @@ def exact_anchors(frame,model,check,budget=1,*,maximum=80, candidate_limit=800):
             matches.append((1.,int(x),int(y),w,h))
     return matches,False
 
+
+def small_anchor_candidates(pixels, model, scales, check, budget):
+    """Verify common icon and label sizes in the original screen pixels."""
+    from PIL import Image
+    sizes = dict.fromkeys((max(4,round(model.width*s)),max(4,round(model.height*s)))
+                          for s in scales if s != 1)
+    found, limited = [], False
+    for w,h in sizes:
+        if (w,h)==(model.width,model.height):
+            continue
+        if h>pixels.shape[0] or w>pixels.shape[1]:
+            continue
+        variant = model.anchor_variant(w,h,Image.Resampling.LANCZOS)
+        hits, pending = exact_anchors(pixels,variant,check,budget,maximum=max(w,h),
+                                      candidate_limit=24)
+        found.extend(hits)
+        limited |= pending
+    return found, limited
 
 
 def tiny_pixels(model,width,height):
@@ -298,9 +330,10 @@ def tiny_size_candidates(screen,model,check,scales,adaptive):
         if w>screen.gray.shape[1] or h>screen.gray.shape[0]:
             continue
         check()
-        from types import SimpleNamespace
+        from PIL import Image
+        from recognition_features import Model
         pixels=tiny_pixels(model,w,h)
-        variant=SimpleNamespace(pixels=pixels,width=w,height=h,flat=False)
+        variant=Model(Image.fromarray(pixels))
         candidates,limited=exact_anchors(screen.pixels,variant,check)
         if not limited:
             results.extend(candidates)

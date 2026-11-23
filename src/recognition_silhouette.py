@@ -35,6 +35,50 @@ def _holes(mask):
                for contour,(_,_,_,parent) in zip(contours,hierarchy[0]))
 
 
+def contradicts_silhouette(pixels, model, box):
+    """Detect contradictory glyph detail in a plausible pixel-match candidate."""
+    reference = model.silhouette
+    if reference is None:
+        return False
+    x,y,w,h = box
+    sx,sy = w/model.width,h/model.height
+    margin_x = max(2,round(.12*reference.width*sx))
+    margin_y = max(2,round(.12*reference.height*sy))
+    x0 = x+max(0,round(reference.x*sx)-margin_x)
+    y0 = y+max(0,round(reference.y*sy)-margin_y)
+    x1 = x+min(w,round((reference.x+reference.width)*sx)+margin_x)
+    y1 = y+min(h,round((reference.y+reference.height)*sy)+margin_y)
+    if isinstance(pixels,np.ndarray):
+        patch = pixels[y0:y1,x0:x1]
+    else:
+        patch = np.asarray(pixels.crop((x0,y0,x1,y1)).convert('RGB'))
+    if not patch.size:
+        return False
+    ink = _mask(patch,reference.lower,reference.upper)
+    left,top,width,height = cv2.boundingRect(ink)
+    # A candidate can extend beyond a label onto a background that shares
+    # its ink color. Remove edge-connected spill from the interior check.
+    if (left==0 or top==0 or left+width==ink.shape[1] or top+height==ink.shape[0]):
+        _, labels = cv2.connectedComponents(ink)
+        edges = np.unique(np.concatenate((labels[0],labels[-1],labels[:,0],labels[:,-1])))
+        if np.any(edges):
+            ink[np.isin(labels,edges[edges!=0])] = 0
+            left,top,width,height = cv2.boundingRect(ink)
+    if min(width,height)<12:
+        return False
+    sx,sy = width/reference.width,height/reference.height
+    if not .84 <= sx/sy <= 1.18:
+        return False
+    observed = _normalize(ink[top:top+height,left:left+width],reference.mask.shape[1])
+    if _holes(observed) != reference.holes:
+        return True
+    for start,end in reference.segments:
+        expected, actual = reference.mask[:,start:end], observed[:,start:end]
+        if np.count_nonzero(expected & actual)<.58*np.count_nonzero(expected | actual):
+            return True
+    return False
+
+
 def verify_silhouette(pixels, reference, threshold, minimum, maximum):
     ink = _mask(pixels, reference.lower, reference.upper)
     x,y,w,h = cv2.boundingRect(ink)

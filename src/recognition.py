@@ -6,9 +6,9 @@ from recognition_search import orientation_candidates, pixel_candidates
 from recognition_verify import verify
 from recognition_pose import pose_candidates
 from recognition_outline import outline_candidates
-from recognition_silhouette import silhouette_candidates, verify_silhouette
+from recognition_silhouette import contradicts_silhouette, silhouette_candidates, verify_silhouette
 from recognition_multiscale import (background,color_boxes,compare_glyphs,glyphs,
-                                    exact_anchors,glyph_candidates,proportional,quick_scaled_candidates,
+                                    exact_anchors,glyph_candidates,proportional,quick_scaled_candidates,small_anchor_candidates,
                                     small_size_candidates,text_variants,tiny_pixels,tiny_size_candidates,verify_text,wide_candidates)
 
 
@@ -263,6 +263,7 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
     adaptive = tuple(sorted(set(configured))) == DEFAULT_SCALES
     prepared = []
     crops = {}
+    full_pixels = None
     for region in regions:
         x,y,w,h = region['rect']
         ox,oy = origin
@@ -276,19 +277,42 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         return crops[box]
 
     def examine(recovery):
+        nonlocal full_pixels
         found, failures = [], []
-        pixels=rgb(frame) if recovery=='silhouette' else None
+        pixels = None
+        if recovery in ('silhouette','fast_anchors','small_anchors'):
+            if full_pixels is None:
+                full_pixels = rgb(frame)
+            pixels = full_pixels
         for region,box,scales in prepared:
             if pixels is not None:
                 l,t,r,b=box
                 view=pixels[t:b,l:r] if 0<=l<r<=frame.width and 0<=t<b<=frame.height else rgb(crop_for(box))
-                r=silhouette_scan(view,model,threshold,scales,offset,check or (lambda:None),adaptive)
-            elif recovery=='fast_anchors':
-                crop=crop_for(box)
-                candidates,limited=exact_anchors(crop,model,check or (lambda:None),budget,maximum=8000,candidate_limit=24)
-                r=_resolve(pose_matches(candidates,model,offset,'exact_rgb'),limited)
+                if recovery=='small_anchors':
+                    if min(model.width,model.height)<=26:
+                        if adaptive:
+                            common = {.8,1.25,1.5}
+                            if source_dpi:
+                                common.add(region['dpi']/source_dpi)
+                        else:
+                            common = scales
+                    else:
+                        common = (.5,1.25)
+                    items,limited=small_anchor_candidates(view,model,sorted(s for s in common if .2<=s<=4),
+                                                           check or (lambda:None),budget)
+                    r=_resolve(pose_matches(items,model,offset,'scaled_rgb'),limited)
+                elif recovery=='fast_anchors':
+                    candidates,limited=exact_anchors(view,model,check or (lambda:None),budget,
+                                                      maximum=8000,candidate_limit=24)
+                    r=_resolve(pose_matches(candidates,model,offset,'exact_rgb'),limited)
+                else:
+                    r=silhouette_scan(view,model,threshold,scales,offset,check or (lambda:None),adaptive)
             else:
-                r = match(crop_for(box),model,threshold,scales,offset,check,recovery=recovery,adaptive=adaptive,budget=budget)
+                crop = crop_for(box)
+                r = match(crop,model,threshold,scales,offset,check,recovery=recovery,adaptive=adaptive,budget=budget)
+                if r['found'] and r.get('method')!='silhouette':
+                    if contradicts_silhouette(crop,model,r['box']):
+                        r = _result('not_found','글자 안쪽 모양이 다름')
             r['monitor'] = region['device']
             if r['box']:
                 x,y,_,_ = region['rect']
@@ -304,19 +328,21 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         return next((r for r in failures if r['status']=='incomplete'),failures[0])
 
     has_silhouette=model.silhouette is not None
-    if quick and has_silhouette:
-        shape=examine('silhouette')
-        if shape['status'] in ('found','ambiguous'):
-            return shape
     if 1. in configured and not model.flat and (fast or max(model.width,model.height)<=80):
         anchors=examine('fast_anchors' if fast else 'anchors')
         if anchors['status'] in ('found','ambiguous'):
             return anchors
-    if not quick and has_silhouette:
+    if has_silhouette:
         shape=examine('silhouette')
         if shape['status'] in ('found','ambiguous'):
             return shape
-    elif fast and quick and not has_silhouette and not model.flat and min(model.width,model.height)>=24:
+    small = 4<=min(model.width,model.height)<=26
+    short_text = adaptive and has_silhouette and max(model.width,model.height)<=360
+    if fast and quick and not model.flat and (small or short_text):
+        scaled=examine('small_anchors')
+        if scaled['status'] in ('found','ambiguous'):
+            return scaled
+    if fast and quick and not model.flat and min(model.width,model.height)>=24:
         scaled=examine('quick_scaled')
         if scaled['status'] in ('found','ambiguous'):
             return scaled
@@ -327,6 +353,8 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         for region,box,_ in prepared:
             x,y,_,_=region['rect']
             for hit in pose_candidates(crop_for(box),model,threshold,offset,check or (lambda:None)):
+                if contradicts_silhouette(crop_for(box),model,hit['box']):
+                    continue
                 a,b,w,h=hit['box']
                 px,py=hit['point']
                 pose.append(dict(hit,box=(a+x,b+y,w,h),point=(px+x,py+y),monitor=region['device'],method='pose'))
@@ -378,11 +406,18 @@ def recheck(frame, model, previous, threshold, offset, check=None):
     if previous.get('method')=='pose':
         hits=pose_candidates(frame,model,threshold,offset,check or (lambda:None),
                              local=(previous['scale'],previous.get('angle',0)))
+        if model.silhouette is not None and hits:
+            pixels = rgb(frame)
+            hits = [hit for hit in hits if not contradicts_silhouette(pixels,model,hit['box'])]
         return _resolve(hits,False)
     screen = Screen(frame)
-    if previous.get('method')=='exact_rgb':
+    if previous.get('method') in ('exact_rgb','scaled_rgb'):
+        reference=model.pixels
+        if previous['method']=='scaled_rgb':
+            from PIL import Image
+            reference=model.anchor_variant(w,h,Image.Resampling.LANCZOS).pixels
         patch=screen.pixels[y:y+h,x:x+w]
-        if patch.shape==model.pixels.shape and cv2.norm(patch,model.pixels,cv2.NORM_INF)<=5:
+        if patch.shape==reference.shape and cv2.norm(patch,reference,cv2.NORM_INF)<=5:
             point=x+min(w-1,round(w*offset[0])),y+min(h-1,round(h*offset[1]))
             return _result('found','발견',dict(previous,point=point))
     if previous.get('method')=='tiny_rgb':
@@ -410,6 +445,8 @@ def recheck(frame, model, previous, threshold, offset, check=None):
         candidate=verify(screen,pixels,gray,x,y,8,threshold,resized)
     if candidate and candidate[0]+1e-6 >= threshold:
         score,a,b = candidate
+        if contradicts_silhouette(screen.pixels,model,(a,b,w,h)):
+            return _result('not_found','글자 안쪽 모양이 다름')
         point = a+min(w-1,round(w*offset[0])), b+min(h-1,round(h*offset[1]))
         return _result('found','발견',dict(score=score, box=(a,b,w,h),point=point,scale=previous['scale']))
     return _result('not_found','최근 화면에서 대상이 이동하거나 사라짐')

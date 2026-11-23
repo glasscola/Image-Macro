@@ -1,6 +1,8 @@
 """Regression checks for the non-blocking watch and local recheck path."""
 import threading
 import unittest
+from unittest.mock import Mock, patch
+from itertools import count
 
 from PIL import Image
 import core
@@ -62,3 +64,31 @@ class TimingTests(unittest.TestCase):
         r.confirm_target=confirm
         r.run()
         self.assertEqual(jobs,['full','local','local','local'])
+
+    def test_next_wait_does_not_start_another_precise_worker_while_old_one_exits(self):
+        first = dict(core.step('image'), image='button')
+        second = dict(core.step('image'), image='button')
+        runner = self.runner([first, second])
+        runner.probe = Mock(side_effect=([MISS]*3+[MATCH])*2)
+        runner.sleep = Mock()
+        ticks = count(step=.2)
+        with patch('core.time.monotonic', side_effect=lambda: next(ticks)), \
+             patch('core.threading.Thread') as thread:
+            thread.return_value.is_alive.return_value = True
+            self.assertTrue(runner.wait_image(first)['found'])
+            self.assertTrue(runner.wait_image(second)['found'])
+        thread.assert_called_once()
+        self.assertTrue(thread.call_args.kwargs['args'][1].is_set())
+
+    def test_precise_worker_start_failure_falls_back_to_full_search(self):
+        step = dict(core.step('image'), image='button')
+        runner = self.runner([step])
+        runner.probe = Mock(side_effect=[MISS]*3+[MATCH])
+        runner.sleep = Mock()
+        ticks = count(step=.2)
+        with patch('core.time.monotonic', side_effect=lambda: next(ticks)), \
+             patch('core.threading.Thread') as thread:
+            thread.return_value.start.side_effect = RuntimeError('thread unavailable')
+            self.assertTrue(runner.wait_image(step)['found'])
+        self.assertEqual([call.kwargs['quick'] for call in runner.probe.call_args_list],
+                         [True, True, True, False])

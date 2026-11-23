@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageGrab
 from imacro_flow import Workflow, Jump, validate_flow
-from automation_errors import TargetUnavailable
+from automation_errors import CaptureError, PointerMoved, TargetUnavailable
 from desktop import MOUSE_BUTTON_LABELS
 
 KINDS = {'image':'이미지 작업','text':'글자 입력','scroll':'스크롤','hold':'키 누르고 있기','wait':'이미지 기다리기', 'find':'이미지 찾기', 'click':'찾은 위치 클릭',
@@ -29,6 +29,10 @@ def decode_image(data):
     return Image.open(io.BytesIO(base64.b64decode(data,validate=True))).convert('RGB')
 
 def project(): return dict(format='ImageMacro',version=1,images={},steps=[])
+
+def repeat_waits_for_image(step, continuous):
+    return (step['kind'] in ('image','wait') and step['failure']=='stop'
+            and not step['otherwise'] and (continuous or step.get('repeat_while_visible',False)))
 
 def walk(steps):
     for s in steps:
@@ -137,9 +141,6 @@ class Halt(Exception): pass
 class Flow(Exception):
     def __init__(self,action,owner=None): self.action=action; self.owner=owner
 
-class CaptureError(RuntimeError): pass
-
-
 class ImageLeft(Exception):
     def __init__(self, image_id):
         self.image_id=image_id
@@ -156,6 +157,8 @@ class Runner(Workflow):
         self.editor_at=editor_at
         self.results={}; self.watches=[]; self.last_watch=0; self.held_keys=set(); self.paused_time=0
         self.probe_cache=threading.local()
+        self.recovery_thread=None
+        self.last_frame=None
         self.route_frame = None
         self.continuous=self.p.get('workflow_repeats',1)==0
         self.templates={k:Model(decode_image(v['data'])) for k,v in p['images'].items()}
@@ -179,16 +182,22 @@ class Runner(Workflow):
     def probe(self,s,image=None,*,shared_frame=None,diagnostic=True,budget=1,quick=False,checkpoint=None):
         roi=s['roi']
         captured=time.monotonic()
-        frame=self.capture(roi) if shared_frame is None else shared_frame
-        if shared_frame is not None and roi:
+        desktop_rect=None
+        if self.native_capture and (roi is None or shared_frame is not None):
             from desktop import bounds
-            ox,oy=bounds()[:2] if self.native_capture else (0,0)
+            desktop_rect=bounds()
+        frame=self.capture(roi) if shared_frame is None else shared_frame
+        if desktop_rect is not None and (frame.size!=tuple(desktop_rect[2:]) or bounds()!=desktop_rect):
+            raise CaptureError('화면 배치 변경 중 · 캡처를 다시 확인합니다')
+        if shared_frame is not None and roi:
+            ox,oy=desktop_rect[:2] if desktop_rect is not None else (0,0)
             x,y,w,h=roi
             frame=frame.crop((x-ox,y-oy,x-ox+w,y-oy+h))
         if min(frame.size)<2: raise CaptureError('화면 캡처 크기 오류')
         asset=self.p['images'][image or s['image']]
         template=self.templates[image or s['image']]
-        if (s['kind']=='condition' or template.silhouette is None) and not frame.getbbox():
+        if (s['kind']=='condition' or s.get('repeat_while_visible') or
+                template.silhouette is None) and not frame.getbbox():
             raise CaptureError('화면 판정 불가: 검은 화면')
         source_dpi=asset.get('dpi')
         cancel=checkpoint or (lambda:self.check(False))
@@ -199,8 +208,7 @@ class Runner(Workflow):
             if roi:
                 origin=roi[:2]
             elif self.native_capture:
-                from desktop import bounds
-                origin=bounds()[:2]
+                origin=desktop_rect[:2]
             else:
                 origin=(0,0)
             r=moving_matches(frame,models,s['threshold'],s['offset'],cancel,
@@ -217,7 +225,12 @@ class Runner(Workflow):
                 dpi=capture_metadata(roi).get('dpi',96)
                 regions=[dict(rect=roi,dpi=dpi,device='지정 영역')];origin=roi[:2]
             else:
-                regions=monitors();origin=bounds()[:2]
+                regions=monitors();origin=desktop_rect[:2]
+                ox,oy,width,height=desktop_rect
+                if bounds()!=desktop_rect or any(
+                        not (ox<=x<x+w<=ox+width and oy<=y<y+h<=oy+height)
+                        for x,y,w,h in (region['rect'] for region in regions)):
+                    raise CaptureError('화면 배치 변경 중 · 캡처를 다시 확인합니다')
             key = (image or s['image'],tuple(origin),repr(regions),tuple(s['scales']),
                    s['threshold'],tuple(s['offset']),budget,quick)
             scope=tuple(roi) if roi else None
@@ -359,7 +372,7 @@ class Runner(Workflow):
         finally:
             self.emit('input_clear',None)
 
-    def send(self,kind,*args):
+    def send(self,kind,*args,revalidate=None,retry_pointer=None):
         self.check()
         self.boundary()
         self.route_frame=None
@@ -376,8 +389,23 @@ class Runner(Workflow):
                 if i:
                     self.check()
                     self.boundary()
-                self.wait_for_pointer_target(x,y)
-                inp.click_at(x,y,getattr(inp.buttons,button))
+                    if revalidate is not None:
+                        x,y=revalidate()
+                while True:
+                    if self.wait_for_pointer_target(x,y) and revalidate is not None:
+                        x,y=revalidate()
+                        continue
+                    self.check(False)
+                    try:
+                        inp.click_at(x,y,getattr(inp.buttons,button))
+                    except PointerMoved as error:
+                        if retry_pointer is None:
+                            raise
+                        self.report_wait(retry_pointer,0,'moved',str(error))
+                        self.sleep(.10)
+                        x,y=revalidate()
+                    else:
+                        break
                 if i+1<clicks:self.sleep(interval)
             return
         if kind=='drag':
@@ -464,7 +492,8 @@ class Runner(Workflow):
             self.gesture_held.clear()
 
     def wait_image(self,s):
-        if not self.native_capture or s['kind'] not in ('image','wait') or s['image_mode']=='once':
+        if (not self.native_capture or s['kind'] not in ('image','wait')
+                or (s['image_mode']=='once' and not repeat_waits_for_image(s,self.continuous))):
             return self.poll_image(s)
         stop=threading.Event()
         try:
@@ -472,12 +501,12 @@ class Runner(Workflow):
         finally:
             stop.set()
 
-    def start_image_recovery(self,step,stop,result):
+    def start_image_recovery(self,step,stop,result,frame=None):
         def checkpoint():
-            if stop.is_set() or self.cancel.is_set():
+            if stop.is_set() or self.cancel.is_set() or self.paused.is_set():
                 raise Halt()
         try:
-            candidate=self.probe(step,diagnostic=False,checkpoint=checkpoint,budget=2)
+            candidate=self.probe(step,shared_frame=frame,diagnostic=False,checkpoint=checkpoint,budget=2)
             if candidate['found'] and not stop.is_set():
                 result.append(candidate)
         except (Halt,CaptureError):
@@ -490,14 +519,14 @@ class Runner(Workflow):
             _,result=self.carried
             self.carried=None
             return result
-        once=s['kind'] not in ('image','wait') or s['image_mode']=='once'
+        retry_missing=repeat_waits_for_image(s,self.continuous)
+        once=s['kind'] not in ('image','wait') or (s['image_mode']=='once' and not retry_missing)
         budget=1
         checks=0
         elapsed=0.
         hits=0
         old=None
         previous=None
-        recovery=None
         recovered=[]
         next_recovery=time.monotonic()+(.16 if s['roi'] is None else .32)
         outage_started=None
@@ -510,7 +539,7 @@ class Runner(Workflow):
             try:
                 point=self.confirm_target(s,previous) if self.native_capture and hits and previous else None
                 if point is None:
-                    quick=recovery_stop is not None or (s.get('moving') and checks%4!=3)
+                    quick=recovery_stop is not None or (s.get('moving',False) and checks%4!=3)
                     candidate=recovered.pop() if recovered else None
                     if isinstance(candidate,Exception):
                         raise candidate
@@ -522,10 +551,20 @@ class Runner(Workflow):
                     else:
                         r=self.probe(s,budget=budget,quick=quick)
                     if quick and recovery_stop and not r['found'] and checks>=2 and started>=next_recovery and (
-                            recovery is None or not recovery.is_alive()):
-                        recovery=threading.Thread(target=self.start_image_recovery,
-                                                  args=(s,recovery_stop,recovered),daemon=True)
-                        recovery.start()
+                            self.recovery_thread is None or not self.recovery_thread.is_alive()):
+                        frame = self.last_frame if s['roi'] is None and not s.get('moving') else None
+                        worker=threading.Thread(target=self.start_image_recovery,
+                                                args=(s,recovery_stop,recovered),
+                                                kwargs={'frame':frame} if frame is not None else {},
+                                                daemon=True,
+                                                name='ImageMacro precise search')
+                        try:
+                            worker.start()
+                        except (OSError,RuntimeError) as error:
+                            self.emit('log',f'백그라운드 검색 시작 실패 · 일반 검색으로 계속 · {error}')
+                            recovery_stop=None
+                        else:
+                            self.recovery_thread=worker
                         next_recovery=started+.18
                 else:
                     x,y,w,h=previous['box']
@@ -533,7 +572,7 @@ class Runner(Workflow):
                     r=dict(previous,point=point,box=(x+point[0]-px,y+point[1]-py,w,h),
                            captured=time.monotonic())
             except CaptureError as error:
-                if self.continuous:
+                if self.continuous or retry_missing:
                     hits,old,previous=0,None,None
                     self.last_frame=None
                     if outage_started is None:
@@ -568,7 +607,7 @@ class Runner(Workflow):
             self.report_wait(s['id'],round(elapsed),status,r['reason'])
             self.sleep(max(0,(.015 if recovery_stop is not None else .045)-(time.monotonic()-started)))
             elapsed+=time.monotonic()-started-(self.paused_time-paused)
-            if not s.get('wait_forever') and elapsed>=s['timeout']:
+            if not retry_missing and not s.get('wait_forever') and elapsed>=s['timeout']:
                 if s['kind']=='wait' or status in ('ambiguous','insufficient','incomplete'):
                     raise TimeoutError(r['reason'])
                 return dict(r,found=False)
@@ -581,7 +620,7 @@ class Runner(Workflow):
             try:
                 point=self.confirm_target(settings,result,**options)
             except CaptureError:
-                if self.continuous and not (retry or repeat):
+                if (self.continuous or retry) and not repeat:
                     self.report_wait(action['id'],0,'capture_error','클릭 위치를 읽을 수 있을 때까지 기다립니다.')
                     self.sleep(.10)
                     continue
@@ -609,27 +648,41 @@ class Runner(Workflow):
 
     def click_detected_image(self,source,result,action,retry=False):
         point,result=self.locate_click(source,result,action,retry)
+        def revalidate():
+            nonlocal result
+            new_point,result=self.locate_click(source,result,action,retry)
+            return new_point
         self.emit('log',f'{source["name"]} · 발견 {result["box"]} → 클릭 {point}')
-        self.send('configured_click',*point,action['button'],action['clicks'],action['interval'])
+        self.send('configured_click',*point,action['button'],action['clicks'],action['interval'],
+                  revalidate=revalidate,
+                  retry_pointer=action['id'] if self.continuous or source.get('repeat_while_visible') else None)
         self.emit('log',f'{source["name"]} · 클릭 입력 전달')
 
-    def presence(self, image, previous=None):
-        if previous and previous.get('box'):
+    def presence(self, image, previous=None, *, budget=1):
+        if previous and previous.get('box') and not image.get('repeat_while_visible'):
             point=self.confirm_target(image,previous)
             if point is not None:
                 x,y,w,h=previous['box']
                 px,py=previous['point']
                 return dict(previous,point=point,box=(x+point[0]-px,y+point[1]-py,w,h))
-        return self.probe(image)
+        return self.probe(image,budget=budget)
 
     def verify_disappearance(self, image, result, following=None, *, local=True):
         misses=0
+        missing_since=None
+        # A visible group can briefly lose its image during redraws or overlays.
+        absence_grace=.75 if self.native_capture and image.get('repeat_while_visible') else 0.
         uncertain=0
+        budget=1
         next_hits=0
+        next_checks=0
         next_candidate=None
-        while misses<2:
-            self.sleep(.025)
+        delay=.025
+        while True:
+            self.sleep(delay)
+            delay=.025
             if following:
+                next_checks+=1
                 detected=self.wait_image_candidate(following)
                 if detected:
                     spread=180 if following.get('moving') else 8
@@ -644,23 +697,40 @@ class Runner(Workflow):
                     next_hits=0
                     next_candidate=None
             try:
-                current=self.presence(image,result if local else None)
+                current=self.presence(image,result if local else None,budget=budget)
             except CaptureError:
                 current=dict(found=False,status='capture_error',reason='화면을 읽을 수 없습니다')
             if current['found']:
+                missing_since=None
+                misses=0
+                if next_hits and next_checks<following['stable']:
+                    result=current
+                    continue
                 return current
             if current['status']=='not_found':
+                now=time.monotonic()-self.paused_time
+                if missing_since is None:
+                    missing_since=now
                 misses+=1
                 uncertain=0
+                budget=1
+                if misses>=2 and now-missing_since>=absence_grace:
+                    break
+                self.report_wait(image['id'],int(now-missing_since),'disappearing',
+                                 '대상이 다시 보이는지 확인합니다')
+                if absence_grace:
+                    # Sample again at the cutoff instead of waiting another full poll.
+                    delay=min(.05,absence_grace-(now-missing_since))
+                elif self.native_capture:
+                    self.sleep(.10)
             else:
                 misses=0
+                missing_since=None
                 uncertain+=1
+                budget=min(8,budget*2) if current['status']=='incomplete' else 1
                 self.report_wait(image['id'],0,current['status'],current['reason'])
-                retrying_capture=self.continuous and current['status']=='capture_error'
-                if uncertain>=20 and not retrying_capture and (not image.get('wait_forever') or image['image_mode']!='wait' or not self.continuous):
+                if uncertain>=20 and not (self.continuous or image.get('repeat_while_visible')):
                     raise RuntimeError(current['reason'])
-            if misses==1:
-                self.report_wait(image['id'],0,'disappearing','다음 화면에서 다시 확인합니다')
         self.emit('log',f'{image["name"]} · 사라짐 확인')
         return None
 
@@ -669,11 +739,12 @@ class Runner(Workflow):
             return None
         if self.top_steps[self.position]['id'] != image['id']:
             return None
-        index=self.position+1
-        if index>=len(self.top_steps):
-            return None
-        step=self.top_steps[index]
-        return step if step['enabled'] and step['kind']=='image' else None
+        step=next((step for step in self.top_steps[self.position+1:] if step['enabled']),None)
+        return step if step and step['kind']=='image' else None
+
+    def retry_image_click(self, image):
+        return (repeat_waits_for_image(image,self.continuous)
+                or (image['image_mode']=='wait' and image.get('wait_forever',False)))
 
     def execute_image_actions(self, image, result):
         uid=image['id']
@@ -685,7 +756,7 @@ class Runner(Workflow):
                 self.emit('image_iteration',(uid,iteration))
             try:
                 if image['image_action']=='click':
-                    self.click_detected_image(image,result,image,retry=image['image_mode']=='wait' and image.get('wait_forever'))
+                    self.click_detected_image(image,result,image,retry=self.retry_image_click(image))
                 self.execute(image['children'])
             except ImageLeft as error:
                 if error.image_id!=uid:
@@ -739,7 +810,7 @@ class Runner(Workflow):
                     if not source or not source[1]['found']:
                         raise RuntimeError('클릭할 인식 결과가 없습니다.')
                     image,found=source
-                    retry=image['image_mode']=='wait' and image.get('wait_forever',False)
+                    retry=self.retry_image_click(image)
                     if s.get('configured_target'):
                         self.click_detected_image(image,found,s,retry=retry)
                     else:
@@ -817,6 +888,8 @@ class Runner(Workflow):
             self.watch_stop.set()
             if self.watch_thread:
                 self.watch_thread.join(.20)
+            if self.recovery_thread:
+                self.recovery_thread.join(.20)
             try:
                 if not self.output and hasattr(self,'input'):
                     self.input.release()
