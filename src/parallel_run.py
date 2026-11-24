@@ -101,7 +101,7 @@ class ParallelRun:
         try:
             for index, view in views.items():
                 keys = {key for step in core.walk(view['steps'])
-                        for key in (step['image'], step['watch'], *step.get('variants', []))}
+                        for key in (step['image'], step['watch'])}
                 view['images'] = {key: value for key, value in project['images'].items() if key in keys}
                 runner = core.Runner(view, lambda kind,value,i=index: self.event(i,kind,value),
                                      capture, output, editor_at=editor_at,

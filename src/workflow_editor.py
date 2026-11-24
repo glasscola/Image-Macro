@@ -35,7 +35,6 @@ class WorkflowEditor:
 
         if stages:
             add('이미지 캡처', lambda: self.capture_target(at=at), primary=True)
-            add('움직임 녹화', lambda: self.capture_motion(at=at), primary=True)
             add('이미지 파일 열기', lambda: self.import_images(at))
         else:
             add('찾은 이미지 클릭', lambda: self.add_detected_click(owner), primary=True)

@@ -2,8 +2,7 @@
 import base64, copy, io, json, math, threading, time, uuid
 from pathlib import Path
 import cv2
-import numpy as np
-from PIL import Image, ImageGrab
+from PIL import Image
 from imacro_flow import Workflow, Jump, validate_flow
 from automation_errors import CaptureError, PointerMoved, TargetUnavailable
 from macro_tabs import tab_count, tab_steps, validate_tabs
@@ -41,7 +40,7 @@ def walk(steps):
         yield s
         yield from walk(s['children']); yield from walk(s['otherwise'])
 
-def validate(p,ready=True):
+def validate(p,ready=True,*,on_legacy_motion=None):
     if p.get('format')!='ImageMacro' or p.get('version')!=1: raise ValueError('지원하지 않는 프로젝트 형식입니다.')
     validate_tabs(p)
     if type(p.get('repeat_on_reappear',False)) is not bool:
@@ -50,9 +49,11 @@ def validate(p,ready=True):
     if type(count) is not int or not 0<=count<=100000:
         raise ValueError('전체 반복 횟수 오류')
     ids=set()
+    converted=0
     def number(v,lo,hi):
         if not isinstance(v,(int,float)) or not math.isfinite(v) or not lo<=v<=hi: raise ValueError('숫자 설정 범위 오류')
     def visit(items,depth=0,loops=0):
+        nonlocal converted
         if depth>24: raise ValueError('중첩이 너무 깊습니다 (최대 24).')
         if not isinstance(items,list): raise ValueError('단계 목록 오류')
         for s in items:
@@ -69,15 +70,11 @@ def validate(p,ready=True):
                 raise ValueError('이미지 반복 설정 오류')
             if ready and repeat and s['enabled'] and not any(child.get('enabled',True) for child in s['children']) and s.get('image_action')!='click':
                 raise ValueError('구간 반복을 켠 이미지에 실행할 행동을 추가하세요.')
-            if 'moving' in s and type(s['moving']) is not bool:
-                raise ValueError('움직이는 대상 설정 오류')
-            if 'motion_feature' in s and (type(s['motion_feature']) is not bool or
-                                          s['motion_feature'] and not s.get('moving')):
-                raise ValueError('색 무늬 모드 설정 오류')
-            variants=s.get('variants',[])
-            if not isinstance(variants,list) or len(variants)>2 or any(
-                    not isinstance(k,str) or k not in p['images'] for k in variants):
-                raise ValueError('추가 이미지 설정 오류')
+            # Legacy recordings already store a representative image in 'image'.
+            moving=s.pop('moving',False)
+            variants=s.pop('variants',[])
+            s.pop('motion_feature',None)
+            converted+=int(bool(moving or variants))
             number(s.get('before',0),0,3600)
             number(s['threshold'],.01,1); number(s['timeout'],.1,3600)
             number(s['stable'],1,100); number(s['seconds'],0,3600); number(s['count'],1,100000)
@@ -104,6 +101,7 @@ def validate(p,ready=True):
         visit(tab_steps(p,index))
     sizes = {}
     for uid,asset in p['images'].items():
+        asset.pop('motion_mask',None)
         number(asset.get('dpi',96),48,768)
         im=decode_image(asset['data'])
         sizes[uid] = im.size
@@ -116,14 +114,17 @@ def validate(p,ready=True):
             if tuple(s['roi'][2:])==size:
                 s['legacy_capture_roi']=s['roi'];s['roi']=None
     validate_flow(p)
+    if converted and on_legacy_motion is not None:
+        on_legacy_motion(converted)
     return p
 
 def save(p,path):
     validate(p,ready=False); path=Path(path); temp=path.with_suffix(path.suffix+'.tmp')
     temp.write_text(json.dumps(p,ensure_ascii=False,indent=2),encoding='utf-8'); temp.replace(path)
 
-def load(path):
-    p=validate(json.loads(Path(path).read_text(encoding='utf-8')),ready=False)
+def load(path,*,on_legacy_motion=None):
+    p=validate(json.loads(Path(path).read_text(encoding='utf-8')),ready=False,
+               on_legacy_motion=on_legacy_motion)
     for index in range(tab_count(p)):
         for s in walk(tab_steps(p,index)):
             if s['kind']=='image' and s['image_mode']=='wait' and s['timeout']==10:
@@ -142,10 +143,7 @@ def expand_image_clicks(project):
             image['image_action']='actions'
 
 
-from recognition import match, search_regions, scale_candidates, Model, recheck
-from recognition_motion import search_appearances
-from recognition_landmark import landmark_model
-from recognition_articulated import recorded_marks
+from recognition import match, search_regions, Model, recheck
 
 class Halt(Exception): pass
 class InputTargetChanged(Exception): pass
@@ -175,20 +173,9 @@ class Runner(Workflow):
         self.probe_cache=threading.local()
         self.recovery_thread=None
         self.last_frame=None
-        self.motion_misses={}
         self.route_frame = None
         self.continuous=self.p.get('workflow_repeats',1)==0
         self.templates={k:Model(decode_image(v['data'])) for k,v in p['images'].items()}
-        for uid,asset in p['images'].items():
-            if 'motion_mask' in asset:
-                mask = np.asarray(decode_image(asset['motion_mask']).convert('L'))
-                model = self.templates[uid]
-                if mask.shape!=(model.height,model.width) or not mask.any():
-                    raise ValueError('움직임 녹화의 윤곽 데이터가 올바르지 않습니다.')
-                model.foreground_mask = (mask!=0).astype(np.uint8)
-                if max(model.width,model.height)>=160:
-                    recorded_marks(model)
-                    recorded_marks(model,pastel=False)
         self.init_flow()
         if self.native_capture and not self.output:
             from desktop import Input
@@ -202,14 +189,9 @@ class Runner(Workflow):
         except Exception as error:
             raise CaptureError(str(error)) from error
 
-    def motion_templates(self,s):
-        return [(uid,self.templates[uid]) for uid in dict.fromkeys([s['image'],*s.get('variants',[])])
-                if uid in self.templates]
-
     def probe(self,s,image=None,*,shared_frame=None,diagnostic=True,budget=1,quick=False,
-              primary_only=False,checkpoint=None,runtime_capture=None):
+              checkpoint=None,runtime_capture=None):
         roi=s['roi']
-        captured=time.monotonic()
         desktop_rect=None
         if self.native_capture and (roi is None or shared_frame is not None):
             from desktop import bounds
@@ -239,38 +221,7 @@ class Runner(Workflow):
             raise CaptureError('화면 판정 불가: 검은 화면')
         source_dpi=asset.get('dpi')
         cancel=checkpoint or (lambda:self.check(False))
-        if s.get('moving') and image is None:
-            models=self.motion_templates(s)
-            if primary_only:
-                models=models[:1]
-            if s.get('motion_feature') and not any(landmark_model(m) is not None for _,m in models):
-                raise ValueError('색 무늬가 사진 중앙에 오고 주위 색이 함께 보이도록 다시 캡처하세요.')
-            if roi:
-                origin=roi[:2]
-            elif self.native_capture:
-                origin=desktop_rect[:2]
-            else:
-                origin=(0,0)
-            recorded = any(hasattr(model,'foreground_mask') for _,model in models)
-            scales = (1.,1.25) if recorded and quick else (
-                tuple(dict.fromkeys([1.,*s['scales'],*((1.25,1.5) if recorded else ())]))
-                if not quick else (1.,))
-            key = (s['id'], origin, frame.size, tuple(scales), primary_only)
-            pixels = frame.tobytes() if self.native_capture else None
-            cached = self.motion_misses.get(quick)
-            if cached is not None and pixels is not None and cached[0] == key and cached[1] == pixels:
-                r = dict(cached[2], unchanged=True)
-            else:
-                r=search_appearances(frame,models,s['threshold'],s['offset'],cancel,
-                                     scales=scales,landmark=s.get('motion_feature',False))
-                if pixels is not None:
-                    self.motion_misses[quick] = (key,pixels,r.copy()) if not r['found'] else None
-            if r['box']:
-                x,y,w,h=r['box']
-                px,py=r['point']
-                r.update(box=(x+origin[0],y+origin[1],w,h),point=(px+origin[0],py+origin[1]),
-                         captured=captured)
-        elif self.native_capture:
+        if self.native_capture:
             from desktop import monitors, bounds, capture_metadata
             if roi:
                 dpi=capture_metadata(roi).get('dpi',96)
@@ -315,14 +266,9 @@ class Runner(Workflow):
             self.last_origin=roi[:2] if roi else (origin if self.native_capture else (0,0))
             self.last_detection=r
         return r
-    def confirm_target(self, s, previous, *, lead=False):
+    def confirm_target(self, s, previous):
         x,y,w,h = previous['box']
-        moving=s.get('moving') and previous.get('asset')
-        if moving:
-            age=max(0,time.monotonic()-previous.get('captured',time.monotonic()))
-            margin=min(220,max(96,round(age*1250)+20))
-        else:
-            margin=8
+        margin=8
         if self.native_capture:
             from desktop import bounds
             bx,by,bw,bh = s['roi'] or bounds()
@@ -338,50 +284,20 @@ class Runner(Workflow):
                     raise CaptureError(str(error)) from error
             else:
                 frame = (self.runtime_capture.confirm(rect,self.capture)
-                         if self.runtime_capture is not None and not moving else self.capture(rect))
+                         if self.runtime_capture is not None else self.capture(rect))
         else:
             frame = self.capture(s['roi'])
             left,top = s['roi'][:2] if s['roi'] else (0,0)
-        sampled=time.monotonic()
         if not frame.getbbox():
             if s['kind']!='condition' and self.templates[s['image']].silhouette is not None:
                 return None
             raise CaptureError('화면 판정 불가: 검은 화면')
         local = dict(previous,box=(x-left,y-top,w,h))
-        if moving:
-            candidates=self.motion_templates(s)
-            candidates.sort(key=lambda entry: entry[0]!=previous.get('asset'))
-            def check_motion(new_frame):
-                return search_appearances(new_frame,candidates,s['threshold'],s['offset'],
-                                      lambda:self.check(False),near=(x-left+w/2,y-top+h/2,margin),
-                                      scales=(previous['scale'],),landmark=previous.get('method')=='landmark')
-            result=check_motion(frame)
-            if lead and self.native_capture and result['found'] and result.get('method')!='recorded_motion' and (
-                    result['point'][0]+left,result['point'][1]+top)==previous['point']:
-                self.cancel.wait(.018)
-                self.check(False)
-                result=check_motion(self.capture((left,top,right-left,bottom-top)))
-                sampled=time.monotonic()
-        else:
-            result=recheck(frame,self.templates[s['image']],local,s['threshold'],s['offset'],
-                           lambda:self.check(False))
+        result=recheck(frame,self.templates[s['image']],local,s['threshold'],s['offset'],
+                       lambda:self.check(False))
         if not result['found']:
             return None
         px,py=result['point']
-        if moving and lead and previous.get('captured') and result.get('method')!='recorded_motion':
-            ax,ay,aw,ah=result['box']
-            dt=max(.012,sampled-previous['captured'])
-            # Anticipate at most one display interval, and keep the
-            # adjusted click inside the rectangle we just verified.
-            for axis,(current,old,size,corner,origin) in enumerate(zip(
-                    (px,py),previous['point'],(aw,ah),(ax,ay),(left,top))):
-                limit=min(22,size*.25)
-                shift=round(max(-limit,min(limit,(current+origin-old)*.023/dt)))
-                adjusted=max(corner,min(corner+size-1,current+shift))
-                if axis==0:
-                    px=adjusted
-                else:
-                    py=adjusted
         return px+left,py+top
 
     def check(self,monitor=True):
@@ -580,7 +496,7 @@ class Runner(Workflow):
 
     def wait_image(self,s):
         capture = None
-        if self.native_capture and self.output is None and self.shared_capture is None and not s.get('moving'):
+        if self.native_capture and self.output is None and self.shared_capture is None:
             from runtime_capture import RuntimeCapture
             if self.runtime_capture is None:
                 self.runtime_capture = RuntimeCapture()
@@ -622,7 +538,6 @@ class Runner(Workflow):
         previous=None
         recovered=[]
         next_recovery=time.monotonic()+(.16 if s['roi'] is None else .32)
-        recovery_pixels=None
         recovery_frame=None
         outage_started=None
         while True:
@@ -631,13 +546,12 @@ class Runner(Workflow):
             self.check()
             if self.paused_time!=paused:
                 recovery_frame=None
-                recovery_pixels=None
             self.boundary()
             quick=False
             try:
                 point=self.confirm_target(s,previous) if self.native_capture and hits and previous else None
                 if point is None:
-                    quick=recovery_stop is not None or (s.get('moving',False) and checks%4!=3)
+                    quick=recovery_stop is not None
                     candidate=recovered.pop() if recovered else None
                     if isinstance(candidate,Exception):
                         raise candidate
@@ -647,21 +561,14 @@ class Runner(Workflow):
                         px,py=candidate['point']
                         r=dict(candidate,point=point,box=(x+point[0]-px,y+point[1]-py,w,h))
                     else:
-                        if (recovery_stop is not None and s.get('moving') and s.get('wait_forever')
-                                and s.get('variants') and not s.get('motion_feature')):
-                            r=self.probe(s,budget=budget,quick=quick,primary_only=True)
-                        elif runtime_capture is not None:
+                        if runtime_capture is not None:
                             r=self.probe(s,budget=budget,quick=quick,runtime_capture=runtime_capture)
                         else:
                             r=self.probe(s,budget=budget,quick=quick)
                     if quick and recovery_stop and not r['found'] and checks>=2 and started>=next_recovery and (
                             self.recovery_thread is None or not self.recovery_thread.is_alive()):
                         frame = self.last_frame
-                        miss = self.motion_misses.get(True) if s.get('moving') else None
-                        pixels = miss[1] if miss else None
-                        if (pixels is None or pixels != recovery_pixels) and (
-                                runtime_capture is None or frame is None or frame is not recovery_frame):
-                            recovery_pixels = pixels
+                        if runtime_capture is None or frame is None or frame is not recovery_frame:
                             recovery_frame = frame
                             shared = frame if s['roi'] is None else None
                             worker=threading.Thread(target=self.start_image_recovery,
@@ -679,8 +586,7 @@ class Runner(Workflow):
                 else:
                     x,y,w,h=previous['box']
                     px,py=previous['point']
-                    r=dict(previous,point=point,box=(x+point[0]-px,y+point[1]-py,w,h),
-                           captured=time.monotonic())
+                    r=dict(previous,point=point,box=(x+point[0]-px,y+point[1]-py,w,h))
             except CaptureError as error:
                 if self.continuous or retry_missing:
                     hits,old,previous=0,None,None
@@ -703,8 +609,7 @@ class Runner(Workflow):
             if once and status in ('ambiguous','insufficient','incomplete','capture_error'):
                 raise RuntimeError(r['reason'])
             point=r['point']
-            spread=180 if s.get('moving') else 8
-            near=old is not None and point is not None and max(abs(a-b) for a,b in zip(point,old))<spread
+            near=old is not None and point is not None and max(abs(a-b) for a,b in zip(point,old))<8
             hits=(hits+1 if near else 1) if r['found'] else 0
             old=point
             previous=r if r['found'] else None
@@ -715,7 +620,7 @@ class Runner(Workflow):
                 return r
             budget=min(8,budget*2) if status=='incomplete' and not quick and checks>2 else 1
             self.report_wait(s['id'],round(elapsed),status,r['reason'])
-            interval = .040 if r.get('unchanged') else (.010 if recovery_stop is not None else .045)
+            interval = .010 if recovery_stop is not None else .045
             self.sleep(max(0,interval-(time.monotonic()-started)))
             elapsed+=time.monotonic()-started-(self.paused_time-paused)
             if not retry_missing and not s.get('wait_forever') and elapsed>=s['timeout']:
@@ -725,11 +630,10 @@ class Runner(Workflow):
 
     def locate_click(self,source,result,action,retry):
         settings=dict(source,offset=action['offset'] if action.get('configured_target') or action is source else source['offset'])
-        options={'lead':True} if source.get('moving') else {}
         repeat=source.get('repeat_while_visible',False)
         while result['found']:
             try:
-                point=self.confirm_target(settings,result,**options)
+                point=self.confirm_target(settings,result)
             except CaptureError:
                 if (self.continuous or retry) and not repeat:
                     self.report_wait(action['id'],0,'capture_error','클릭 위치를 읽을 수 있을 때까지 기다립니다.')
@@ -831,8 +735,7 @@ class Runner(Workflow):
                 next_checks+=1
                 detected=self.wait_image_candidate(following)
                 if detected:
-                    spread=180 if following.get('moving') else 8
-                    near=next_candidate and max(abs(a-b) for a,b in zip(detected['point'],next_candidate['point']))<spread
+                    near=next_candidate and max(abs(a-b) for a,b in zip(detected['point'],next_candidate['point']))<8
                     next_hits=next_hits+1 if near else 1
                     next_candidate=detected
                     if next_hits>=following['stable']:
@@ -1041,10 +944,6 @@ class Runner(Workflow):
                 self.watches.remove(w)
     def run(self):
         try:
-            if self.native_capture and not self.output and any(
-                    s.get('moving') and s['enabled'] for s in walk(self.p['steps'])):
-                from desktop import Input
-                self.input=Input()
             self.execute_workflow()
             self.emit('state','완료')
         except Halt: self.emit('state','정지됨')

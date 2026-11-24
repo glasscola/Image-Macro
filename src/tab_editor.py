@@ -64,10 +64,10 @@ class TabEditor:
                          bg='#eaf0ff' if selected else '#ffffff',
                          fg='#a92743' if state == '오류' else blue if selected else ink,
                          highlightbackground=blue if selected else '#dae3ee',
-                         state='disabled' if self.recorder or self.motion_recording else 'normal')
+                         state='disabled' if self.recorder else 'normal')
 
     def select_tab(self, index):
-        if self.recorder or self.motion_recording or self.active_tab == index:
+        if self.recorder or self.active_tab == index:
             return
         self.active_tab = index
         self.selected.clear()
