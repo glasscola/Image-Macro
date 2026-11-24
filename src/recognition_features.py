@@ -93,7 +93,7 @@ class Model:
 
 class Screen:
     def __init__(self, image):
-        self.pixels = rgb(image)
+        self.pixels = image if isinstance(image,np.ndarray) else rgb(image)
         self.gray = cv2.cvtColor(self.pixels, cv2.COLOR_RGB2GRAY)
         self.coarse = {}
         self.maps = None

@@ -126,6 +126,24 @@ class ImageRepeatTests(unittest.TestCase):
             self.assertIsNone(runner.verify_disappearance(image,{}))
         self.assertGreaterEqual(elapsed-misses[5],.75)
 
+    def test_native_group_checks_with_larger_budget_before_leaving(self):
+        runner = self.runner()
+        runner.native_capture = True
+        image = dict(self.first,repeat_while_visible=True)
+        visible = dict(found=True,status='found',point=(10,10))
+        absent = dict(found=False,status='not_found')
+        elapsed = 0.
+
+        def sleep(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        runner.sleep = sleep
+        runner.probe = Mock(side_effect=lambda _,budget=1:visible if budget>=2 else absent)
+        with patch('core.time.monotonic',side_effect=lambda:elapsed):
+            self.assertIs(runner.verify_disappearance(image,{}),visible)
+        self.assertGreaterEqual(elapsed,.75)
+
     def test_workflow_repeats_all_steps(self):
         self.project['workflow_repeats']=3
         runner=self.runner()

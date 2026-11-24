@@ -231,7 +231,7 @@ def match(frame, template, threshold=.9, scales=(1.,), offset=(.5,.5), check=Non
         if min(frame.size)<4:
             return _result('not_found','검색 영역이 작음')
         if adaptive:
-            scales=tuple(sorted(set(scales)|{.5,.625,.67,.75,1.25,1.5}))
+            scales=tuple(dict.fromkeys((1.25,.8,.5,.625,*scales,.67,.75,1.5)))
         items,limited=quick_scaled_candidates(Screen(frame),model,scales,threshold,check)
         return _resolve(pose_matches(items,model,offset),limited)
     if recovery in ('small','wide'):
@@ -280,7 +280,9 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         nonlocal full_pixels
         found, failures = [], []
         pixels = None
-        if recovery in ('silhouette','fast_anchors','small_anchors'):
+        array_search = recovery in ('silhouette','fast_anchors','small_anchors','button_scale',
+                                    'scaled_anchors','quick_scaled')
+        if array_search:
             if full_pixels is None:
                 full_pixels = rgb(frame)
             pixels = full_pixels
@@ -288,7 +290,25 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
             if pixels is not None:
                 l,t,r,b=box
                 view=pixels[t:b,l:r] if 0<=l<r<=frame.width and 0<=t<b<=frame.height else rgb(crop_for(box))
-                if recovery=='small_anchors':
+                if recovery=='quick_scaled':
+                    ordered = tuple(dict.fromkeys((1.25,.8,.5,.625,*scales,.67,.75,1.5))) if adaptive else scales
+                    items,limited=quick_scaled_candidates(Screen(view),model,ordered,threshold,check or (lambda:None))
+                    r=_resolve(pose_matches(items,model,offset),limited)
+                    if r['found'] and contradicts_silhouette(view,model,r['box']):
+                        r=_result('not_found','글자 안쪽 모양이 다름')
+                elif recovery=='scaled_anchors':
+                    common = list(scales)
+                    if adaptive:
+                        common = [.8,1.25] if quick else [*scales,1.25,4/3]
+                        if source_dpi:
+                            common.append(region['dpi']/source_dpi)
+                    items,limited=small_anchor_candidates(view,model,[s for s in common if .2<=s<=4],
+                                                           check or (lambda:None),budget)
+                    r=_resolve(pose_matches(items,model,offset,'scaled_rgb'),limited)
+                elif recovery=='button_scale':
+                    items,limited=small_anchor_candidates(view,model,(1.25,),check or (lambda:None),budget)
+                    r=_resolve(pose_matches(items,model,offset,'scaled_rgb'),limited)
+                elif recovery=='small_anchors':
                     if min(model.width,model.height)<=26:
                         if adaptive:
                             common = {.8,1.25,1.5}
@@ -332,6 +352,16 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         anchors=examine('fast_anchors' if fast else 'anchors')
         if anchors['status'] in ('found','ambiguous'):
             return anchors
+    # A full-pixel match at the rendered size is stronger evidence than a
+    # silhouette. The latter can also match part of a striped illustration.
+    if has_silhouette and min(model.width,model.height)>26:
+        scaled=examine('scaled_anchors')
+        if scaled['status'] in ('found','ambiguous'):
+            return scaled
+    elif fast and quick and adaptive and 27<=model.height<=110 and 2*model.height<=model.width<=400:
+        resized_button=examine('button_scale')
+        if resized_button['status'] in ('found','ambiguous'):
+            return resized_button
     if has_silhouette:
         shape=examine('silhouette')
         if shape['status'] in ('found','ambiguous'):
@@ -342,7 +372,7 @@ def search_regions(frame, template, regions, origin, configured, source_dpi,
         scaled=examine('small_anchors')
         if scaled['status'] in ('found','ambiguous'):
             return scaled
-    if fast and quick and not model.flat and min(model.width,model.height)>=24:
+    if fast and quick and not model.flat and min(model.width,model.height)>26:
         scaled=examine('quick_scaled')
         if scaled['status'] in ('found','ambiguous'):
             return scaled
@@ -410,16 +440,16 @@ def recheck(frame, model, previous, threshold, offset, check=None):
             pixels = rgb(frame)
             hits = [hit for hit in hits if not contradicts_silhouette(pixels,model,hit['box'])]
         return _resolve(hits,False)
-    screen = Screen(frame)
     if previous.get('method') in ('exact_rgb','scaled_rgb'):
         reference=model.pixels
         if previous['method']=='scaled_rgb':
             from PIL import Image
             reference=model.anchor_variant(w,h,Image.Resampling.LANCZOS).pixels
-        patch=screen.pixels[y:y+h,x:x+w]
+        patch=rgb(frame)[y:y+h,x:x+w]
         if patch.shape==reference.shape and cv2.norm(patch,reference,cv2.NORM_INF)<=5:
             point=x+min(w-1,round(w*offset[0])),y+min(h-1,round(h*offset[1]))
             return _result('found','발견',dict(previous,point=point))
+    screen = Screen(frame)
     if previous.get('method')=='tiny_rgb':
         pixels=tiny_pixels(model,w,h)
         patch=screen.pixels[y:y+h,x:x+w]

@@ -38,43 +38,103 @@ def functions():
     return user, gdi
 
 
-def capture_rectangle(x, y, width, height, *, include_layered=True):
-    if width <= 0 or height <= 0:
-        raise ValueError("캡처 크기가 올바르지 않습니다.")
-    user, gdi = functions()
-    source = user.GetDC(None)
-    if not source:
-        raise ctypes.WinError(ctypes.get_last_error())
+@lru_cache(maxsize=1)
+def _compare_bytes():
+    compare = ctypes.CDLL('msvcrt').memcmp
+    compare.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+    compare.restype = ctypes.c_int
+    return compare
 
-    destination = bitmap = previous = None
-    try:
-        destination = gdi.CreateCompatibleDC(source)
-        if not destination:
+
+class CaptureBuffer:
+    """Reuse the destination bitmap on the worker that owns the capture session."""
+    def __init__(self):
+        self.destination = self.bitmap = self.previous = self.pixels = None
+        self.size = None
+        self.snapshot = self.snapshot_key = self.image = None
+
+    def _allocate(self, source, width, height):
+        self.close()
+        _, gdi = functions()
+        self.destination = gdi.CreateCompatibleDC(source)
+        if not self.destination:
             raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            self._select_bitmap(source,width,height)
+        except OSError:
+            self.close()
+            raise
+
+    def _select_bitmap(self, source, width, height):
+        _, gdi = functions()
         header = BitmapHeader(size=ctypes.sizeof(BitmapHeader), width=width,
                               height=-height, planes=1, bits=32)
         data = ctypes.c_void_p()
-        bitmap = gdi.CreateDIBSection(destination, ctypes.byref(header), 0,
-                                      ctypes.byref(data), None, 0)
-        if not bitmap or not data:
+        self.bitmap = gdi.CreateDIBSection(source, ctypes.byref(header), 0,
+                                           ctypes.byref(data), None, 0)
+        if not self.bitmap or not data:
             raise ctypes.WinError(ctypes.get_last_error())
-        previous = gdi.SelectObject(destination, bitmap)
+        previous = gdi.SelectObject(self.destination, self.bitmap)
         if not previous or previous == ctypes.c_void_p(-1).value:
-            previous = None
             raise ctypes.WinError(ctypes.get_last_error())
-        raster_operation = 0x00CC0020  # SRCCOPY
-        if include_layered:
-            raster_operation |= 0x40000000  # CAPTUREBLT
-        if not gdi.BitBlt(destination, 0, 0, width, height, source, x, y, raster_operation):
+        self.previous = previous
+        self.pixels = (ctypes.c_ubyte * (width * height * 4)).from_address(data.value)
+        self.size = (width,height)
+
+    def read(self, x, y, width, height, *, include_layered=True, reuse_unchanged=False):
+        if width <= 0 or height <= 0:
+            raise ValueError("캡처 크기가 올바르지 않습니다.")
+        user,gdi = functions()
+        source = user.GetDC(None)
+        if not source:
             raise ctypes.WinError(ctypes.get_last_error())
-        gdi.GdiFlush()
-        pixels = ctypes.string_at(data, width * height * 4)
-        return Image.frombytes("RGB", (width, height), pixels, "raw", "BGRX")
+        try:
+            if self.size != (width,height):
+                self._allocate(source,width,height)
+            operation = 0x40CC0020 if include_layered else 0x00CC0020
+            if not gdi.BitBlt(self.destination, 0, 0, width, height, source, x, y, operation):
+                raise ctypes.WinError(ctypes.get_last_error())
+            gdi.GdiFlush()
+            key = (x,y,include_layered) if reuse_unchanged else None
+            return self._image_from_pixels(key)
+        except OSError:
+            self.close()
+            raise
+        finally:
+            user.ReleaseDC(None,source)
+
+    def _image_from_pixels(self, key):
+        if key is not None:
+            count = ctypes.sizeof(self.pixels)
+            if (self.snapshot_key == key and self.snapshot is not None
+                    and _compare_bytes()(self.pixels,self.snapshot,count) == 0):
+                return self.image
+        # The returned RGB image owns its pixels across subsequent reads.
+        image = Image.frombytes("RGB",self.size,self.pixels,"raw","BGRX")
+        if key is not None:
+            if self.snapshot is None:
+                self.snapshot = ctypes.create_string_buffer(count)
+            ctypes.memmove(self.snapshot,self.pixels,count)
+            self.snapshot_key,self.image = key,image
+        return image
+
+    def close(self):
+        self.snapshot = self.snapshot_key = self.image = None
+        if not self.destination:
+            return
+        _,gdi = functions()
+        self.pixels = None
+        if self.previous:
+            gdi.SelectObject(self.destination,self.previous)
+        if self.bitmap:
+            gdi.DeleteObject(self.bitmap)
+        gdi.DeleteDC(self.destination)
+        self.destination = self.bitmap = self.previous = self.size = None
+
+
+def capture_rectangle(x, y, width, height, *, include_layered=True):
+    buffer = CaptureBuffer()
+    try:
+        return buffer.read(x,y,width,height,include_layered=include_layered)
     finally:
-        if previous:
-            gdi.SelectObject(destination, previous)
-        if bitmap:
-            gdi.DeleteObject(bitmap)
-        if destination:
-            gdi.DeleteDC(destination)
-        user.ReleaseDC(None, source)
+        buffer.close()

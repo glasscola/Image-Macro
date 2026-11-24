@@ -115,17 +115,15 @@ class CaptureRecoveryTests(unittest.TestCase):
         black = Image.new('RGB', (6, 5))
         green = Image.new('RGB', (6, 5), 'green')
         red = Image.new('RGB', (8, 4), 'red')
-        with patch('selection_capture.capture_gpu', return_value=[('right', red)]), \
-             patch('selection_capture.desktop.capture', side_effect=[black, green]) as fallback, \
+        with patch('selection_capture.desktop.capture', side_effect=[black, green, red]) as fallback, \
              patch('selection_capture.time.sleep'):
             frame = capture_visible_desktop((-6, 0, 14, 5), displays)
         self.assertEqual(frame.getpixel((1, 2)), (0, 128, 0))
         self.assertEqual(frame.getpixel((7, 2)), (255, 0, 0))
-        self.assertEqual(fallback.call_count, 2)
+        self.assertEqual(fallback.call_count, 3)
 
     def test_still_black_does_not_open_a_drag_selection(self):
-        with patch('selection_capture.capture_gpu', return_value=[]), \
-             patch('selection_capture.desktop.capture', return_value=Image.new('RGB', (8, 8))), \
+        with patch('selection_capture.desktop.capture', return_value=Image.new('RGB', (8, 8))), \
              patch('selection_capture.time.sleep'):
             with self.assertRaisesRegex(RuntimeError, '검게 읽혀'):
                 capture_visible_desktop((0, 0, 8, 8), [dict(device='screen', rect=(0, 0, 8, 8))])
@@ -181,3 +179,28 @@ class CaptureRecoveryTests(unittest.TestCase):
         output.assert_called_once()
         self.assertEqual(runner.probe.call_count, 26)
         self.assertIn(('state', '정지됨'), [call.args for call in emitted.call_args_list])
+
+    def test_visible_repeat_recovers_when_recorded_window_is_temporarily_covered(self):
+        frame = Image.new('RGB',(8,8),'red')
+        project = core.project()
+        project['images']['target'] = dict(name='target',data=core.encode_image(frame))
+        action = core.step('record')
+        image = dict(core.step('image'),image='target',image_action='actions',
+                     repeat_while_visible=True,children=[action])
+        project['steps'] = [image]
+        runner = core.Runner(project,Mock(),lambda _:frame,Mock())
+        step = runner.top_steps[0]
+        event = dict(type='key',key='a',down=True,delay=0)
+        release = dict(event,down=False)
+        step['children'][0]['events'] = [event,release]
+        runner.send = Mock(side_effect=[TargetUnavailable('covered'),None,
+                                       TargetUnavailable('covered during gesture')])
+        runner.input = Mock()
+        runner.sleep = Mock()
+        runner.verify_disappearance = Mock(return_value=None)
+        runner.execute_image_actions(step,dict(found=True,point=(4,4)))
+        self.assertEqual([call.args[1] for call in runner.send.call_args_list],[event,event,release])
+        runner.input.release.assert_called_once()
+        self.assertFalse(runner.gesture_held)
+        self.assertEqual(runner.visible_repeat_depth,0)
+        runner.verify_disappearance.assert_called_once()

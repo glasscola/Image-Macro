@@ -52,7 +52,7 @@ def make_landmark(model):
         if len(ring)<45:
             return None
         surround=np.median(ring,axis=0)
-        if np.max(np.abs(surround-color))<37:
+        if np.max(np.abs(surround-color))<getattr(model,'min_landmark_contrast',37):
             return None
         consistent=(np.max(np.abs(ring.astype(np.int16)-surround),axis=1)<=32).mean()
         if consistent<.48:
@@ -67,7 +67,7 @@ def landmark_model(model):
     return model._color_landmark
 
 
-def landmark_candidates(frame,templates,threshold,offset,check,near=None):
+def landmark_candidates(frame,templates,threshold,offset,check,near=None,*,deformable=False):
     pixels=np.asarray(frame)
     result=[]
     for uid,model in templates:
@@ -91,7 +91,7 @@ def landmark_candidates(frame,templates,threshold,offset,check,near=None):
             if other is None:
                 continue
             distance=cv2.matchShapes(contour,other,cv2.CONTOURS_MATCH_I1,0)
-            if distance>.22:
+            if distance>(.27 if deformable else .22):
                 continue
             ring=ring_pixels(pixels,shape,x,y,w,h)
             if len(ring)<40:
@@ -108,7 +108,8 @@ def landmark_candidates(frame,templates,threshold,offset,check,near=None):
             py=round(cy+(offset[1]-.5)*h)
             px=min(x+w-1,max(x,px))
             py=min(y+h-1,max(y,py))
-            score=float(1.-distance*.8-(1.-context)*.10-min(.045,abs(np.log(scale))*.048))
+            shape_weight = .54 if deformable else .8
+            score=float(1.-distance*shape_weight-(1.-context)*.10-min(.045,abs(np.log(scale))*.048))
             if score<threshold:
                 continue
             result.append(dict(score=score,box=(x,y,w,h),point=(px,py),

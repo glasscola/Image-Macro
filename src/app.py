@@ -15,11 +15,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import uuid
 
-from PIL import Image, ImageDraw, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageGrab, ImageOps, ImageTk
 from pynput import keyboard
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import core
+from editor_menu import open_editor_menu
+from editor_layout import wrap_controls
 from image_files import load_image
 import desktop
 
@@ -29,7 +31,12 @@ from recording import Recorder
 from screen_ui import select_screen, exclude, root_window_at, user
 from imacro_flow import validate_flow
 from workflow_editor import WorkflowEditor
+from motion_capture import record_appearances
+from macro_tabs import MAX_TABS, tab_count, tab_name, tab_project, tab_steps
+from parallel_run import ParallelRun
+from tab_editor import TabEditor
 
+APP_TITLE='Image Macro v58'
 BG='#f0f4f9'
 WHITE='#ffffff'
 INK='#14253b'
@@ -41,21 +48,21 @@ NAMES={'point':'클릭','drag':'드래그','key':'키 누르기','hold':'길게 
        'text':'글자 입력','scroll':'스크롤','image':'나타나면 클릭','wait':'나타날 때까지 기다리기',
        'find':'화면에서 찾기','condition':'보이는지 확인','break':'이 반복 종료','continue':'다음 반복으로',
        'stop':'실행 종료','record':'녹화','delay':'대기','click':'찾은 곳 클릭','loop':'반복'}
-COLORS={'running':('#eaf0ff',BLUE),'done':('#e9faf2','#166a50'),
+COLORS={'running':('#eaf0ff',BLUE),'done':(WHITE,'#166a50'),
         'error':('#fff0f0','#a92743'),'paused':('#fff5df','#855510'),
         'stopped':('#f2f4f7',MUTED)}
 
 
-class App(WorkflowEditor,TkinterDnD.Tk):
+class App(TabEditor,WorkflowEditor,TkinterDnD.Tk):
     def __init__(self,path=None):
         super().__init__()
-        self.title('Image Macro v42')
+        self.title(APP_TITLE)
         self.destroying=False
         icon = Path(__file__).with_name('image-macro.ico')
         self.collapsed = set()
         self.picker = None
         self.geometry('1060x720')
-        self.minsize(700,480)
+        self.minsize(560,480)
         self.configure(bg=BG)
         self.option_add('*Font',(FONT,10))
         self.project=core.project()
@@ -69,6 +76,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.queue=queue.Queue()
         self.runner=None
         self.recorder=None
+        self.motion_recording=False
         self.run_status=''
         self.current=None
         self.states={}
@@ -113,36 +121,38 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                          activeforeground=WHITE if primary else INK,cursor='hand2',font=(FONT,10,'bold'))
 
     def build(self):
-        bar=tk.Frame(self,bg=WHITE,padx=24,pady=14,highlightthickness=1,highlightbackground=LINE)
+        bar=tk.Frame(self,bg=WHITE,padx=16,pady=7,highlightthickness=1,highlightbackground=LINE)
         bar.pack(fill='x')
-        icon=Path(__file__).with_name('image-macro.ico')
-        try:
-            with Image.open(icon) as original:
-                mark=original.resize((32,32),Image.Resampling.LANCZOS)
-            self.brand_icon=ImageTk.PhotoImage(mark,master=self)
-        except (OSError,tk.TclError):
-            pass
-        else:
-            tk.Label(bar,image=self.brand_icon,bg=WHITE).pack(side='left',padx=(0,9))
-        tk.Label(bar,text='Image Macro v42',font=('Segoe UI',19,'bold'),bg=WHITE,fg=INK).pack(side='left')
-        self.file_button=self.button(bar,'새 작업  ▾',self.file_menu)
-        self.file_button.pack(side='left',padx=18)
-        self.run_button=self.button(bar,'▶  실행',self.run,True)
-        self.run_button.pack(side='right')
-        self.cycle_button=self.button(bar,'전체 실행 · 1회',self.choose_cycles)
-        self.cycle_button.pack(side='right',padx=8)
+        self.toolbar=bar
+        bar.grid_columnconfigure(1,weight=1)
+        settings=tk.Frame(bar,bg=WHITE)
+        self.toolbar_settings=settings
+        self.file_button=self.button(bar,'프로젝트  ▾',self.file_menu)
+        self.file_button.grid(row=0,column=0,sticky='w',padx=(0,10))
+        self.cycle_button=self.button(settings,'탭 실행 · 1회',self.choose_cycles)
+        self.cycle_button.pack(side='left')
         self.cycle_caption=''
-
-        self.stop_button=self.button(bar,'■  정지',self.stop)
-        self.pause_button=self.button(bar,'일시정지',self.pause)
+        controls=tk.Frame(bar,bg=WHITE)
+        controls.grid(row=0,column=2,sticky='e')
+        self.toolbar_controls=controls
+        self.run_button=self.button(controls,'▶  전체 실행',self.run,True)
+        self.run_button.pack(side='right')
+        self.stop_button=self.button(controls,'■  정지',self.stop,True)
+        self.stop_button.configure(bg='#a52b46',activebackground='#842037',highlightbackground='#a52b46')
+        self.pause_button=self.button(controls,'일시정지',self.pause)
+        for action in (self.file_button,self.cycle_button,self.run_button,self.stop_button,self.pause_button):
+            action.configure(padx=11,pady=5)
+        self.compact_toolbar=None
+        bar.bind('<Configure>',lambda _:self.layout_toolbar())
         self.body=tk.Frame(self,bg=BG)
-        self.body.pack(fill='both',expand=True,padx=30,pady=(24,0))
+        self.body.pack(fill='both',expand=True,padx=18,pady=(12,0))
         head=tk.Frame(self.body,bg=BG)
-        head.pack(fill='x',pady=(0,13))
-        tk.Label(head,text='작업 순서',font=(FONT,21,'bold'),bg=BG,fg=INK).pack(side='left')
+        head.pack(fill='x',pady=(0,9))
+        tk.Label(head,text='작업 순서',font=(FONT,17,'bold'),bg=BG,fg=INK).pack(side='left')
         self.total=tk.Label(head,bg=BG,fg=MUTED)
         self.total.pack(side='left',padx=13)
         self.record_button=self.button(head,'●  녹화 시작',self.toggle_record)
+        self.build_tabs(self.body,BG,INK,BLUE)
         panel=tk.Frame(self.body,bg=WHITE,highlightthickness=1,highlightbackground=LINE)
         panel.pack(fill='both',expand=True)
         self.next_stage=tk.Frame(self.body,bg=BG)
@@ -160,15 +170,17 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.canvas.dnd_bind('<<Drop>>',self.drop)
         self.list.drop_target_register(DND_FILES)
         self.list.dnd_bind('<<Drop>>',self.drop)
-        foot=tk.Frame(self,bg=BG,padx=30,pady=11)
-        foot.pack(fill='x')
+        foot=tk.Frame(self,bg=BG,padx=18,pady=6)
+        foot.pack(fill='x',side='bottom',before=self.body)
+        self.status_bar=foot
         self.status=tk.Label(foot,bg=BG,fg=MUTED,anchor='w',text='준비')
-        self.status.pack(side='left',fill='x',expand=True)
-        self.logs=tk.Label(foot,text='실행 기록',fg=BLUE,bg=BG,cursor='hand2')
+        self.logs=self.button(foot,'실행 기록',self.show_log)
+        self.logs.configure(padx=8,pady=3)
         self.logs.pack(side='right')
-        self.logs.bind('<Button-1>',lambda _:self.show_log())
         self.diagnostics=tk.Label(foot,text='읽은 화면',fg=BLUE,bg=BG,cursor='hand2')
         self.diagnostics.bind('<Button-1>',lambda _:self.show_frame())
+        self.status.pack(side='left',fill='x',expand=True,padx=(0,10))
+        self.status.bind('<Configure>',lambda e:e.widget.configure(wraplength=max(100,e.width-3)))
         # Desktop file drops resolve against the visible row under the pointer.
         self.drop_widgets=(self.canvas,self.list)
 
@@ -180,15 +192,16 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         return event.widget.winfo_toplevel()!=self
 
     def editable(self):
-        return not self.runner and not self.recorder
+        return not self.runner and not self.recorder and not self.motion_recording
 
     def file_menu(self):
-        menu=tk.Menu(self,tearoff=0)
-        for label,fn in [('새 작업',self.new),('열기…',self.open),('저장',self.save),
-                         ('다른 이름으로 저장…',lambda:self.save(True)),
-                         ('실행 취소',self.undo),('다시 실행',self.redo)]:
-            menu.add_command(label=label,command=fn,state='normal' if self.editable() else 'disabled')
-        menu.tk_popup(self.file_button.winfo_rootx(),self.file_button.winfo_rooty()+self.file_button.winfo_height())
+        if self.editable():
+            open_editor_menu(self,self.file_button,[
+                ('새 작업',self.new,True,False),
+                ('프로젝트 열기…',self.open,True,False),
+                ('저장',self.save,True,False),
+                ('다른 이름으로 저장…',lambda:self.save(True),True,False),
+            ])
 
     def snapshot(self):
         self.undo_items.append(copy.deepcopy(self.project))
@@ -206,6 +219,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if self.editable() and source:
             dest.append(self.project)
             self.project=source.pop()
+            self.active_tab=min(self.active_tab,tab_count(self.project)-1)
+            self.clear_tab_run()
             self.selected.clear()
             self.preview_cache.clear()
             self.states.clear()
@@ -234,6 +249,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.status.configure(text='이전 흐름 설정은 해제되었습니다. 각 이미지 카드에서 반복을 켤 수 있습니다.')
 
     def reset(self):
+        self.active_tab=0
+        self.clear_tab_run()
         self.collapsed.clear()
         self.status.configure(text='준비')
         self.selected.clear()
@@ -306,7 +323,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def locate(self,uid,items=None):
         if items is None:
-            items=self.project['steps']
+            items=self.tab_steps
         for i,s in enumerate(items):
             if s['id']==uid:
                 return items,i,s
@@ -321,7 +338,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             if uid in self.selected:
                 items,i,_=self.locate(uid)
                 return items,i+1
-        items=self.project['steps']
+        items=self.tab_steps
         return items,len(items)
 
     def insert(self,s,at=None,snapshot=True):
@@ -334,24 +351,28 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         return s
 
     def choose_cycles(self):
-        menu=tk.Menu(self,tearoff=False)
-        menu.add_command(label='1회 실행',command=lambda:self.save_cycles(1))
-        menu.add_command(label='계속 반복',command=lambda:self.save_cycles(0))
-        if sum(step['enabled'] for step in self.project['steps'])==1:
-            menu.add_command(label='계속 반복 · 이미지가 다시 나타날 때만',command=lambda:self.save_cycles(0,True))
+        if not self.editable():
+            return
+        count=self.tab_options.get('workflow_repeats',1)
+        reappear=self.tab_options.get('repeat_on_reappear',False)
+        entries=[
+            ('1회 실행',lambda:self.save_cycles(1),True,count==1),
+            ('계속 반복',lambda:self.save_cycles(0),True,count==0 and not reappear),
+        ]
+        if sum(step['enabled'] for step in self.tab_steps)==1:
+            entries.append(('다시 나타날 때만 반복',lambda:self.save_cycles(0,True),True,count==0 and reappear))
         def custom():
-            n=simpledialog.askinteger('전체 실행 횟수','마지막 카드까지 몇 번 실행할까요?',
+            n=simpledialog.askinteger('탭 실행 횟수','이 탭의 마지막 카드까지 몇 번 실행할까요?',
                                        initialvalue=3,minvalue=1,maxvalue=100000,parent=self)
             if n is not None:
                 self.save_cycles(n)
-        menu.add_command(label='횟수 지정…',command=custom)
-        menu.tk_popup(self.cycle_button.winfo_rootx(),
-                      self.cycle_button.winfo_rooty()+self.cycle_button.winfo_height())
+        entries.append(('횟수 지정…',custom,True,count>1))
+        open_editor_menu(self,self.cycle_button,entries)
 
     def save_cycles(self,count,reappear=False):
         self.snapshot()
-        self.project['workflow_repeats']=count
-        self.project['repeat_on_reappear']=reappear
+        self.tab_options['workflow_repeats']=count
+        self.tab_options['repeat_on_reappear']=reappear
         self.render()
 
     def render_transition(self, step, next_step):
@@ -367,24 +388,46 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 condition='이 이미지가 사라지거나 다음 이미지가 보이면'
             text=f'{condition} → {self.top_numbers[next_step["id"]]+1:02} {name}'
         row=tk.Frame(self.list,bg=WHITE)
-        row.pack(fill='x',padx=52,pady=4)
-        tk.Label(row,text=text,bg=WHITE,fg=MUTED).pack(side='left')
+        row.pack(fill='x',padx=(42,12),pady=5)
+        summary=tk.Label(row,text=text,bg=WHITE,fg=MUTED,anchor='w',justify='left')
+        summary.pack(fill='x')
+        summary.bind('<Configure>',lambda event:summary.configure(wraplength=max(90,event.width-4)))
         if next_step and next_step['kind']=='image' and step.get('repeat_while_visible'):
             self.button(row,'다음 이미지 우선 해제' if step.get('advance_on_next') else '다음 이미지가 보이면 이동',
-                        lambda:self.change(step,advance_on_next=not step.get('advance_on_next',False))).pack(side='right')
+                        lambda:self.change(step,advance_on_next=not step.get('advance_on_next',False))).pack(anchor='w')
 
     def update_header(self):
-        count=self.project.get('workflow_repeats',1)
-        display=f'{count}회' if count else '재등장마다 반복' if self.project.get('repeat_on_reappear') else '계속 반복'
-        self.cycle_button.configure(text='전체 실행 · '+display,
+        count=self.tab_options.get('workflow_repeats',1)
+        display=f'{count}회' if count else '재등장마다' if self.tab_options.get('repeat_on_reappear') else '계속'
+        self.cycle_button.configure(text='탭 실행 · '+display,
                                     state='normal' if self.editable() else 'disabled')
-        title=self.path.name.removesuffix('.imacro.json') if self.path else '새 작업'
+        title=self.path.name.removesuffix('.imacro.json') if self.path else '프로젝트'
+        if len(title)>15:
+            title=title[:14]+'…'
         self.file_button.configure(text=title+('  •' if self.dirty else '')+'  ▾')
-        count = len(self.project['steps'])
+        count = len(self.tab_steps)
         self.total.configure(text=f'{count}단계' if count else '')
-        self.run_button.configure(state='normal' if self.editable() and self.rows else 'disabled')
+        self.run_button.configure(state='normal' if self.editable() and self.runnable_tabs() else 'disabled')
         self.record_button.configure(text='■  녹화 끝내기 · F7' if self.recorder else '●  녹화 시작',
                                     state='disabled' if self.runner else 'normal')
+        self.after_idle(self.layout_toolbar)
+
+    def layout_toolbar(self):
+        bar=self.toolbar
+        settings=self.toolbar_settings
+        controls=self.toolbar_controls
+        inset=2*(int(bar['padx'])+int(bar['highlightthickness']))
+        top_width=self.file_button.winfo_reqwidth()+controls.winfo_reqwidth()+10
+        minimum=max(560,max(settings.winfo_reqwidth(),top_width)+inset)
+        if self.minsize()[0]!=minimum:
+            self.minsize(minimum,480)
+        compact=bar.winfo_width()<settings.winfo_reqwidth()+top_width+inset+12
+        if compact!=self.compact_toolbar:
+            self.compact_toolbar=compact
+            if compact:
+                settings.grid(row=1,column=0,columnspan=3,sticky='w',pady=(8,0))
+            else:
+                settings.grid(row=0,column=1,columnspan=1,sticky='w',pady=0)
 
     def thumbnail(self,data,key,size=(58,42)):
         tag=(key,size)
@@ -440,27 +483,29 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         return title,desc
 
     def render(self):
+        self.render_tabs()
         for container in (self.list,self.next_stage):
             for widget in container.winfo_children():
                 widget.destroy()
         self.next_stage.pack_forget()
         self.rows={}
         self.picker=None
-        self.top_numbers={s['id']:i for i,s in enumerate(self.project['steps'])}
+        self.top_numbers={s['id']:i for i,s in enumerate(self.tab_steps)}
         self.image_buttons={}
         self.visible_parent={}
         self.stage_numbers={}
-        for i,step in enumerate(self.project['steps'],1):
+        for i,step in enumerate(self.tab_steps,1):
             self.stage_numbers.update((node['id'],i) for node in core.walk([step]))
-        if not self.project['steps']:
-            box=tk.Frame(self.list,bg=WHITE,padx=24,pady=60)
+        if not self.tab_steps:
+            box=tk.Frame(self.list,bg=WHITE,padx=20,pady=34)
             box.pack(fill='x')
-            tk.Label(box,text='첫 동작을 만들어 보세요',bg=WHITE,fg=INK,font=(FONT,23,'bold')).pack()
-            tk.Label(box,text='매크로를 시작할 화면의 이미지나 버튼을 고르세요.',
-                     bg=WHITE,fg=MUTED,pady=12).pack()
+            tk.Label(box,text='첫 대상을 선택하세요',bg=WHITE,fg=INK,font=(FONT,18,'bold')).pack()
+            tk.Label(box,text='화면에서 찾을 이미지나 움직이는 대상을 등록합니다.',
+                     bg=WHITE,fg=MUTED,pady=8).pack()
             actions=tk.Frame(box,bg=WHITE)
             actions.pack(pady=10)
-            self.button(actions,'화면에서 대상 선택',self.capture_target,True).pack(side='left',padx=5)
+            self.button(actions,'이미지 캡처',self.capture_target,True).pack(side='left',padx=5)
+            self.button(actions,'움직임 녹화',self.capture_motion,True).pack(side='left',padx=5)
             hint=tk.Label(box,text='이미지를 Ctrl+V로 붙여넣거나 여기에 끌어놓기  ·  파일 열기',
                           bg=WHITE,fg=BLUE,cursor='hand2',pady=12)
             hint.pack()
@@ -476,38 +521,43 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 self.record_button.pack(side='right')
             else:
                 self.record_button.pack_forget()
-            steps=self.project['steps']
+            steps=self.tab_steps
             for i,step in enumerate(steps):
                 self.render_rows([step])
                 self.render_transition(step,steps[i+1] if i+1<len(steps) else None)
             if self.editable():
                 footer=self.next_stage
-                footer.pack(fill='x',pady=(9,0))
-                at=(self.project['steps'],len(self.project['steps']))
-                self.button(footer,'＋  다음 이미지 선택',lambda:self.capture_target(at=at),True).pack(side='left')
-                self.button(footer,'이미지 파일 열기',lambda:self.import_images(at)).pack(side='left',padx=8)
+                footer.pack(fill='x',side='bottom',pady=(7,0),before=self.canvas.master)
+                at=(self.tab_steps,len(self.tab_steps))
+                choices=tk.Frame(footer,bg=BG)
+                choices.pack(fill='x')
+                image_button=self.button(choices,'＋  다음 이미지 선택',lambda:self.capture_target(at=at),True)
+                video_button=self.button(choices,'＋  다음 영상 녹화',lambda:self.capture_motion(at=at),True)
+                for button in (image_button,video_button):
+                    button.configure(padx=10,pady=5)
+                wrap_controls(choices,[image_button,video_button],equal_width=True)
+                files=self.button(footer,'파일에서 추가',lambda:self.import_images(at))
+                files.configure(padx=5,pady=1,font=(FONT,9),fg=BLUE,bg=BG,highlightthickness=0)
+                files.pack(anchor='e')
         self.update_header()
 
     def render_rows(self,items,depth=0):
         for s in items:
             uid=s['id']
             slab=tk.Frame(self.list,bg=WHITE)
-            slab.pack(fill='x',padx=(15+depth*37,15),pady=(8,0))
+            slab.pack(fill='x',padx=(12+min(depth,4)*19,12),pady=(8,0))
             row=tk.Frame(slab,padx=10,pady=8,highlightthickness=1,highlightbackground=LINE)
             row.pack(side='left',fill='x',expand=True)
             index=f'{self.top_numbers[uid]+1:02}' if not depth else '↳'
-            number=tk.Label(row,text=f'⠿  {index}',width=6,anchor='w',cursor='fleur')
-            number.pack(side='left')
+            row.grid_columnconfigure(3,weight=1)
+            number=tk.Label(row,text=f'⠿ {index}',width=5,anchor='w',cursor='fleur')
+            number.grid(row=0,column=1,sticky='w')
             folded=uid in self.collapsed
-            if s['kind']=='image':
-                fold=self.button(row,'▸ 펼치기' if folded else '▾ 접기',lambda u=uid:self.toggle_fold(u))
-                fold.configure(width=8,padx=2,pady=3)
-                fold.pack(side='left',padx=(0,8))
-                if self.editable():
-                    repeat=self.button(row,'구간 반복 켜짐' if s.get('repeat_while_visible') else '구간 반복',
-                                       lambda step=s:self.toggle_image_repeat(step),bool(s.get('repeat_while_visible')))
-                    repeat.configure(padx=7,pady=3)
-                    repeat.pack(side='right',padx=(6,0))
+            is_image=s['kind']=='image'
+            if s['kind'] in ('image','loop'):
+                fold=self.button(row,'▸' if folded else '▾',lambda u=uid:self.toggle_fold(u))
+                fold.configure(width=2,padx=2,pady=1,highlightthickness=0)
+                fold.grid(row=0,column=0,padx=(0,5))
             labels=[]
             asset=self.project['images'].get(s['image'],{})
             image_data=asset.get('data') or s.get('preview')
@@ -515,35 +565,50 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 photo=self.thumbnail(image_data,s['image'] or uid)
                 if photo:
                     cover=tk.Label(row,image=photo,cursor='hand2')
-                    cover.pack(side='left',padx=(0,12))
-                    cover.bind('<Double-1>',lambda _,a=s:self.details(a))
+                    cover.grid(row=0,column=2,padx=(0,9))
                     labels.append(cover)
-            ellipsis=tk.Label(row,text='•••',cursor='hand2',width=4)
-            ellipsis.pack(side='right')
-            if self.editable():
-                edit=self.button(row,'설정' if s['kind']=='image' else '편집',lambda a=s:self.details(a))
+            ellipsis=tk.Label(row,text='⋯',cursor='hand2',width=3,takefocus=True)
+            ellipsis.grid(row=0,column=5)
+            if self.editable() and not is_image:
+                edit=self.button(row,'편집',lambda a=s:self.details(a))
                 edit.configure(padx=7,pady=3)
-                edit.pack(side='right')
-            indicator=tk.Label(row,width=13 if self.runner else 1,anchor='e',font=(FONT,9,'bold'))
-            indicator.pack(side='right')
+                edit.grid(row=0,column=4,padx=(5,0))
+            indicator=tk.Label(row,anchor='e',font=(FONT,9,'bold'))
+            indicator.grid(row=1,column=4,columnspan=2,sticky='e',pady=(4,0))
             title,desc=self.caption(s)
-            label=tk.Label(row,text=title,anchor='w',font=(FONT,11,'bold'))
-            label.pack(side='top',fill='x')
-            sub=tk.Label(row,text=desc,anchor='w',font=(FONT,9))
+            label=tk.Label(row,text=title,anchor='w',justify='left',font=(FONT,11,'bold'),
+                           wraplength=260)
+            label.grid(row=0,column=3,sticky='ew')
+            label.bind('<Configure>',lambda _=None,w=label:w.configure(wraplength=max(65,w.winfo_width()-4)))
+            sub=tk.Label(row,text=desc,anchor='w',justify='left',font=(FONT,9))
             if desc:
-                sub.pack(side='top',fill='x')
+                sub.grid(row=1,column=1,columnspan=3,sticky='ew',pady=(4,0))
+                sub.bind('<Configure>',lambda _=None,w=sub:w.configure(wraplength=max(65,w.winfo_width()-4)))
+            if is_image and self.editable():
+                repeats=bool(s.get('repeat_while_visible'))
+                repeat=self.button(row,'보이는 동안 반복 · 켜짐' if repeats else '보이는 동안 반복',
+                                   lambda step=s:self.toggle_image_repeat(step),repeats)
+                repeat.configure(padx=7,pady=2)
+                repeat.grid(row=2,column=1,columnspan=5,sticky='w',pady=(6,0))
             self.rows[uid]=(row,number,indicator,[label,sub,ellipsis]+labels)
             self.paint(uid)
             for widget in (row,number,label,sub,*labels):
-                widget.bind('<Button-1>',lambda e,u=uid:self.row_down(e,u))
+                widget.bind('<Button-1>',lambda e=None,u=uid:self.row_down(e,u) if e else None)
                 if widget is number:
                     widget.bind('<B1-Motion>',self.row_motion)
                     widget.bind('<ButtonRelease-1>',self.row_up)
-                widget.bind('<Double-1>',lambda _,a=s:self.details(a))
-                widget.bind('<Button-3>',lambda e,a=s:self.context(a,e.x_root,e.y_root))
+                widget.bind('<Double-1>',lambda _=None,a=s:self.details(a) if _ else None)
+                widget.bind('<Button-3>',lambda e=None,a=s:self.context(a,e.x_root,e.y_root) if e else None)
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind('<<Drop>>',self.drop)
-            ellipsis.bind('<Button-1>',lambda e,a=s:self.context(a,e.x_root,e.y_root))
+            ellipsis.bind('<Button-1>',lambda e=None,a=s:self.context(a,e.x_root,e.y_root) if e else None)
+            ellipsis.bind('<Return>',lambda e=None,a=s:self.context(a,e.widget.winfo_rootx(),e.widget.winfo_rooty()) if e else None)
+            if is_image and self.editable():
+                for target in (label,*labels):
+                    target.configure(cursor='hand2',takefocus=True)
+                    target.bind('<Button-1>',lambda e=None,a=s:self.target_card_click(e,a) if e else None)
+                    target.bind('<Double-1>',lambda _=None:'break')
+                    target.bind('<Return>',lambda _=None,a=s:self.details(a) if _ else None)
             if folded:
                 for branch in ('children','otherwise'):
                     for child in core.walk(s[branch]):
@@ -561,14 +626,20 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def action_footer(self, step, depth):
         footer=tk.Frame(self.list,bg=WHITE,highlightthickness=0)
-        footer.pack(fill='x',padx=(52+depth*37,15),pady=(4,8))
+        footer.pack(fill='x',padx=(42+min(depth,4)*19,12),pady=(4,8))
         if step['kind']=='loop':
             at=(step['children'],len(step['children']))
             self.button(footer,'＋ 반복 안에 단계 추가',lambda:self.show_picker(footer,at=at,stages=True)).pack(anchor='w')
             return
-        button=self.button(footer,'＋ 이 이미지가 보이면 할 행동',lambda:self.show_picker(footer,step))
+        button=self.button(footer,'＋ 행동 추가',lambda:self.show_picker(footer,step))
         button.pack(anchor='w')
         self.image_buttons[step['id']]=button
+
+    def target_card_click(self,event,step):
+        if event.state&5:
+            self.row_down(event,step['id'])
+        else:
+            self.details(step)
 
     def toggle_fold(self, uid):
         if uid in self.collapsed:
@@ -602,14 +673,18 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                     child_state,_=self.states.get(self.current,('',''))
                     if child_state in ('running','paused'):
                         state,detail=child_state,'행동 실행 중'
-        bg,fg=COLORS.get(state,('#eef2ff' if uid in self.selected else WHITE,INK))
+        visible_current=self.visible_parent.get(self.current,self.current)
+        if self.runner and state in ('running','paused') and uid!=visible_current:
+            state,detail='',''
+        bg,fg=COLORS.get(state,('#f3f6ff' if uid in self.selected else WHITE,INK))
         s=self.locate(uid)[2]
         if not s['enabled']:
             fg=MUTED
             detail='실행 제외'
-        row.configure(bg=bg,highlightbackground=BLUE if uid in self.selected else LINE)
+        edge=BLUE if state in ('running','paused') else '#b6c6f1' if uid in self.selected else LINE
+        row.configure(bg=bg,highlightbackground=edge)
         number.configure(bg=bg,fg=MUTED)
-        status.configure(bg=bg,fg=fg,text=detail,width=14 if detail else 1)
+        status.configure(bg=bg,fg=fg,text='✓' if state=='done' else detail)
         for widget in labels:
             widget.configure(bg=bg,fg=fg)
 
@@ -689,7 +764,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if not self.editable():
             return
         menu=tk.Menu(self,tearoff=0)
-        menu.add_command(label='화면에서 대상 선택',command=lambda:self.capture_target(at=at))
+        menu.add_command(label='이미지 캡처',command=lambda:self.capture_target(at=at))
+        menu.add_command(label='움직임 녹화',command=lambda:self.capture_motion(at=at))
         menu.add_command(label='이미지 파일 열기…',command=lambda:self.import_images(at))
         menu.add_separator()
         for label,fn in [('화면에서 클릭 위치 찍기',lambda:self.pick_motion('point',at=at)),
@@ -728,6 +804,16 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         menu.add_command(label='실행 제외' if s['enabled'] else '다시 포함',command=lambda:self.change(s,enabled=not s['enabled']))
         menu.add_separator()
         menu.add_command(label='복제',command=lambda:self.duplicate(s,items,i))
+        if items is self.tab_steps:
+            count=tab_count(self.project)
+            choices=tk.Menu(menu,tearoff=0)
+            for index in range(count):
+                if index!=self.active_tab:
+                    choices.add_command(label=tab_name(self.project,index),
+                                        command=lambda target=index:self.move_stage_to_tab(s,target))
+            if count<MAX_TABS:
+                choices.add_command(label='새 탭',command=lambda:self.move_stage_to_tab(s,count))
+            menu.add_cascade(label='다른 탭으로 이동',menu=choices)
         menu.add_command(label='삭제',command=self.delete)
         menu.tk_popup(x,y)
 
@@ -782,7 +868,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.snapshot()
             uid=self.asset(image,name,roi)
             if replace:
-                replace['image']=uid
+                replace.update(image=uid,variants=[],moving=False,motion_feature=False)
                 self.render()
             else:
                 s=core.step('image')
@@ -846,10 +932,10 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         hit=self.hit_row(event.y_root)
         at=None
         if hit:
-            owner=next((s for s in self.project['steps']
+            owner=next((s for s in self.tab_steps
                         if any(child['id']==hit[0] for child in core.walk([s]))),None)
             if owner:
-                items=self.project['steps']
+                items=self.tab_steps
                 at=(items,items.index(owner)+int(hit[1]))
         paths=self.tk.splitlist(event.data)
         if len(paths)==1 and paths[0].lower().endswith('.imacro.json'):
@@ -1081,10 +1167,87 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.change(step,offset=offset,button=choice.get(),clicks=n,interval=pause)
         self.button(panel,'적용',save,True).pack(anchor='e')
 
+    def capture_motion(self,s=None,*,at=None):
+        if not self.editable() or self.grab_current():
+            return
+
+        def selected(seed,rect):
+            bounds = desktop.bounds()
+            self.motion_recording = True
+            self.update_header()
+            self.withdraw()
+
+            def record():
+                try:
+                    samples = record_appearances(seed,rect,bounds,desktop.capture_runtime)
+                    self.queue.put(('motion_samples',(s,samples,None,at)))
+                except Exception as error:
+                    self.queue.put(('motion_samples',(s,[],str(error),at)))
+
+            try:
+                threading.Thread(target=record,daemon=True,name='ImageMacro motion recording').start()
+            except (OSError,RuntimeError) as error:
+                self.review_motion(s,[],str(error),at)
+
+        self.status.configure(text='움직임 녹화 · 움직일 대상을 여백과 함께 둘러싸세요')
+        select_screen(self,'image',selected)
+
+    def review_motion(self,s,samples,error,at=None):
+        self.motion_recording = False
+        self.update_header()
+        self.deiconify()
+        if error:
+            self.status.configure(text='움직임 녹화를 다시 시도하세요.')
+            messagebox.showerror('움직임 녹화',error,parent=self)
+            return
+        if not self.editable():
+            return
+        win = self.dialog('녹화한 모습 등록')
+        box = tk.Frame(win,bg=WHITE,padx=18,pady=14)
+        box.pack(fill='x')
+        tk.Label(box,text='같은 대상의 모습만 선택하세요. 회색 영역은 검색에서 제외됩니다.',
+                 bg=WHITE,fg=INK).pack(anchor='w',pady=(0,8))
+        choices = []
+        for index,(image,mask,_) in enumerate(samples,1):
+            use = tk.BooleanVar(value=True)
+            choices.append(use)
+            display = Image.composite(image,Image.new('RGB',image.size,'#b6beca'),
+                                      Image.fromarray(mask*255))
+            display.thumbnail((140,90))
+            photo = ImageTk.PhotoImage(display,master=win)
+            item = tk.Checkbutton(box,text=f'모습 {index}',variable=use,image=photo,
+                                  compound='left',bg=WHITE)
+            item.image = photo
+            item.pack(anchor='w',pady=3)
+
+        def save():
+            selected = [sample for sample,use in zip(samples,choices) if use.get()]
+            if not selected or not self.editable():
+                return
+            self.snapshot()
+            ids = []
+            for index,(image,mask,rect) in enumerate(selected,1):
+                uid = self.asset(image,f'녹화 모습 {index}',rect)
+                self.project['images'][uid]['motion_mask'] = core.encode_image(Image.fromarray(mask*255))
+                ids.append(uid)
+            target = s if s is not None else core.step('image')
+            target.update(image=ids[0],variants=ids[1:],moving=True,motion_feature=False)
+            win.destroy()
+            if s is None:
+                target.update(image_action='actions',image_mode='wait',wait_forever=True)
+                self.insert(target,at,snapshot=False)
+            else:
+                self.render()
+            self.status.configure(text=f'움직임 녹화 · 모습 {len(ids)}개 등록')
+
+        self.button(box,'선택한 모습 등록',save).pack(fill='x',pady=(8,0))
+
     def motion_settings(self,s):
         win=self.dialog('움직이는 대상')
         box=tk.Frame(win,bg=WHITE,padx=18,pady=14)
         box.pack(fill='x')
+        self.button(box,'움직임 녹화로 대상 등록',
+                    lambda:(win.destroy(),self.capture_motion(s))).pack(fill='x',pady=(0,8))
         enabled=tk.BooleanVar(value=s.get('moving',False))
         feature=tk.BooleanVar(value=s.get('motion_feature',False))
         def toggle():
@@ -1128,37 +1291,76 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                         self.change(s,variants=[v for v in variants if v!=u]))).pack(fill='x',pady=4)
 
     def image_details(self,s):
-        win=self.dialog(self.caption(s)[0])
+        win=self.dialog('대상 설정')
+        win.resizable(False,False)
+        win.bind('<Escape>',lambda _:win.destroy())
         asset=self.project['images'].get(s['image'])
-        panel=tk.Frame(win,bg=WHITE,padx=20,pady=14)
+        panel=tk.Frame(win,bg=WHITE,padx=18,pady=16)
         panel.pack(fill='both',expand=True)
         if asset:
-            im=core.decode_image(asset['data'])
-            tk.Label(panel,text=f'등록 크기 {im.width} × {im.height} 픽셀',bg=WHITE,fg=MUTED).pack(anchor='w')
-            img=self.thumbnail(asset['data'],s['image'],(410,170))
-            if img:
-                c=tk.Canvas(panel,width=img.width(),height=img.height(),bg=WHITE,
-                            highlightthickness=0)
-                c.pack(anchor='w',pady=(0,8))
-                c.photo=img
-                c.create_image(0,0,image=img,anchor='nw')
-        def button(text,fn):
-            self.button(panel,text,lambda:(win.destroy(),fn())).pack(fill='x',pady=(8,0))
-        button('화면에서 대상 다시 선택',lambda:self.capture_target(replace=s))
-        button('이미지 파일로 교체',lambda:self.import_images(replace=s))
-        if self.project['images']:
-            button('프로젝트의 이미지 선택…',lambda:self.choose_asset(s,'image'))
+            image=core.decode_image(asset['data'])
+            width,height=image.size
+            header=tk.Frame(panel,bg=WHITE)
+            header.pack(fill='x',pady=(0,15))
+            photo=ImageTk.PhotoImage(ImageOps.pad(image.convert('RGB'),(108,86),
+                                                  Image.Resampling.LANCZOS,color=BG),master=win)
+            preview=self.button(header,'크게 보기',lambda:self.target_preview(win,image))
+            preview.configure(image=photo,compound='top',padx=4,pady=4,font=(FONT,9))
+            preview.photo=photo
+            preview.pack(side='left',padx=(0,13))
+            details=tk.Frame(header,bg=WHITE)
+            details.pack(side='left',fill='x',expand=True)
+            tk.Label(details,text=asset['name'],font=(FONT,12,'bold'),bg=WHITE,fg=INK,
+                     wraplength=225,justify='left').pack(anchor='w',pady=(0,4))
+            kind='움직이는 대상' if s.get('moving') else '정지 이미지'
+            tk.Label(details,text=f'{kind}  ·  {width} × {height} px',bg=WHITE,fg=MUTED).pack(anchor='w')
+        tk.Frame(panel,bg=LINE,height=1).pack(fill='x',pady=(0,12))
+        tk.Label(panel,text='대상 바꾸기',font=(FONT,10,'bold'),bg=WHITE,fg=INK).pack(anchor='w',pady=(0,6))
+        primary=tk.Frame(panel,bg=WHITE)
+        primary.pack(fill='x')
+        primary.grid_columnconfigure(0,weight=1,uniform='replace')
+        self.button(primary,'이미지 캡처',lambda:(win.destroy(),self.capture_target(replace=s)),True).grid(
+            row=0,column=0,sticky='ew',padx=(0,4 if s['kind']=='image' else 0))
         if s['kind']=='image':
-            button('다른 모습 추가 및 움직이는 대상…',lambda:self.motion_settings(s))
-        if s['kind'] in ('image','wait'):
-            button('나타날 때까지 계속 기다림',lambda:self.change(s,wait_forever=True,image_mode='wait'))
-            def limit():
-                value=simpledialog.askfloat('기다릴 시간','최대 기다림 (초)',minvalue=.1,maxvalue=3600,
-                                            initialvalue=s['timeout'],parent=self)
-                if value is not None:
-                    self.change(s,timeout=value,wait_forever=False,image_mode='wait')
-            button('기다릴 시간 제한…',limit)
-        button('인식 세부 설정…',lambda:self.advanced(s))
+            primary.grid_columnconfigure(1,weight=1,uniform='replace')
+            self.button(primary,'움직임 녹화',lambda:(win.destroy(),self.capture_motion(s)),True).grid(
+                row=0,column=1,sticky='ew',padx=(4,0))
+        controls=tk.Frame(panel,bg=WHITE)
+        controls.pack(fill='x',pady=(10,0))
+        more=self.button(controls,'파일·보관함에서 선택 ▾',lambda:open_editor_menu(self,more,[
+            ('이미지 파일로 교체…',lambda:(win.destroy(),self.import_images(replace=s)),True,False),
+            ('등록한 이미지 선택…',lambda:(win.destroy(),self.choose_asset(s,'image')),
+             bool(self.project['images']),False),
+        ]))
+        more.configure(padx=5,pady=3,font=(FONT,9),fg=BLUE,highlightthickness=0)
+        more.pack(side='left')
+        settings=self.button(controls,'인식 설정…',lambda:(win.destroy(),self.advanced(s)))
+        settings.configure(padx=5,pady=3,font=(FONT,9),fg=BLUE,highlightthickness=0)
+        settings.pack(side='right')
+
+    def target_preview(self,owner,image):
+        win=tk.Toplevel(owner)
+        win.title('대상 미리보기')
+        win.transient(owner)
+        win.configure(bg=WHITE,padx=12,pady=12)
+        win.resizable(False,False)
+        preview=ImageOps.contain(image,(520,380),Image.Resampling.LANCZOS)
+        photo=ImageTk.PhotoImage(preview,master=win)
+        label=tk.Label(win,image=photo,bg=WHITE)
+        label.photo=photo
+        label.pack()
+
+        def close():
+            win.destroy()
+            owner.grab_set()
+            owner.focus_set()
+
+        button=self.button(win,'닫기',close)
+        button.pack(anchor='e',pady=(8,0))
+        win.protocol('WM_DELETE_WINDOW',close)
+        win.bind('<Escape>',lambda _:close())
+        win.grab_set()
+        button.focus_set()
 
     def choose_asset(self,s,field):
         win=self.dialog('프로젝트 이미지 선택')
@@ -1166,7 +1368,10 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         box.pack(fill='both')
         def choose(uid):
             win.destroy()
-            self.change(s,**{field:uid})
+            values={field:uid}
+            if field=='image' and uid!=s['image']:
+                values.update(variants=[],moving=False,motion_feature=False)
+            self.change(s,**values)
         images=tk.Listbox(box,height=min(12,len(self.project['images'])),width=46,exportselection=False)
         images.pack(fill='x')
         ids=list(self.project['images'])
@@ -1190,11 +1395,34 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                lambda im,roi:self.change(s,roi=list(roi),scope_explicit=True)))
         if s['roi']:
             action('모든 모니터에서 찾기',lambda:self.change(s,roi=None))
+        if s['kind'] in ('image','wait'):
+            wait = ('한 번 확인' if s['image_mode']=='once' else
+                    '계속 기다림' if s['wait_forever'] else f'최대 {s["timeout"]:g}초')
+            action(f'대기 방식  ·  {wait}',lambda:self.choose_image_wait(s))
         if s['kind']=='image':
-            mode='once' if s['image_mode']=='wait' else 'wait'
-            action('한 번만 확인' if mode=='once' else '나타날 때까지 확인',lambda:self.change(s,image_mode=mode))
+            action('다른 모습·움직임 설정…',lambda:self.motion_settings(s))
         failure='skip' if s['failure']=='stop' else 'stop'
         action('실패 시 다음으로' if failure=='skip' else '실패 시 실행 멈추기',lambda:self.change(s,failure=failure))
+
+    def choose_image_wait(self,s):
+        win=self.dialog('대기 방식')
+        box=tk.Frame(win,bg=WHITE,padx=16,pady=14)
+        box.pack(fill='x')
+
+        def apply(**values):
+            win.destroy()
+            self.change(s,**values)
+
+        def limit():
+            value=simpledialog.askfloat('기다릴 시간','최대 기다림 (초)',minvalue=.1,maxvalue=3600,
+                                        initialvalue=s['timeout'],parent=win)
+            if value is not None:
+                apply(timeout=value,wait_forever=False,image_mode='wait')
+
+        self.button(box,'나타날 때까지 기다리기',lambda:apply(wait_forever=True,image_mode='wait')).pack(fill='x')
+        self.button(box,'시간 제한 지정…',limit).pack(fill='x',pady=(6,0))
+        if s['kind']=='image':
+            self.button(box,'한 번만 확인',lambda:apply(image_mode='once')).pack(fill='x',pady=(6,0))
 
     def loop_details(self,s):
         win=self.dialog(self.caption(s)[0])
@@ -1309,7 +1537,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         if self.grab_current():
             return
         self.record_at=self.insertion() if at is None else at
-        owner=next((s for s in core.walk(self.project['steps']) if s['children'] is self.record_at[0]),None)
+        owner=next((s for s in core.walk(self.tab_steps) if s['children'] is self.record_at[0]),None)
         dest=self.caption(owner)[0] if owner else '다음 단계'
         self.record_added=0
         self.recorder=Recorder(lambda *row:self.queue.put(('record_row',row)))
@@ -1355,21 +1583,38 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         self.record_added+=1
 
 
-    def run(self):
-        if not self.editable() or not self.rows:
+    def runnable_tabs(self):
+        return [index for index in range(tab_count(self.project))
+                if any(step['enabled'] for step in tab_steps(self.project,index))]
+
+    def run(self,current_only=False):
+        indices=self.runnable_tabs()
+        if current_only:
+            indices=[index for index in indices if index==self.active_tab]
+        if not self.editable() or not indices:
             return
         try:
             editor_handle=user.GetAncestor(self.winfo_id(),2)
-            self.runner=core.Runner(copy.deepcopy(self.project),lambda k,v:self.queue.put((k,v)),
-                                    editor_at=lambda x,y:bool(editor_handle) and root_window_at(x,y)==editor_handle)
+            emit=lambda k,v:self.queue.put((k,v))
+            options=dict(editor_at=lambda x,y:bool(editor_handle) and root_window_at(x,y)==editor_handle)
+            source=copy.deepcopy(self.project)
+            if len(indices)==1:
+                index=indices[0]
+                notify=lambda kind,value:emit(kind,value) if kind=='done' else emit('single_tab_event',(index,kind,value))
+                self.runner=core.Runner(tab_project(source,index),notify,**options)
+                self.runner.tab_index=index
+            else:
+                self.runner=ParallelRun(source,indices,emit,**options)
         except Exception as e:
             messagebox.showerror('실행 준비',str(e),parent=self)
             return
         self.states.clear()
         self.iterations.clear()
+        self.clear_tab_run()
+        self.tab_status.update((index,'감시 중') for index in indices)
         self.current=None
         self.log=[]
-        self.diagnostics.pack(side='right',padx=12)
+        self.diagnostics.pack(side='right',padx=(0,10),before=self.status)
         self.last_wait_state=None
         self.last_completed_step=None
         self.last_error=''
@@ -1391,6 +1636,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
     def start_runner(self):
         runner=self.runner
         if runner.cancel.is_set():
+            if isinstance(runner,ParallelRun):
+                runner.close()
             self.event('state','정지됨')
             self.event('done',None)
             return
@@ -1405,6 +1652,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.fail_run_start(error)
 
     def fail_run_start(self,error):
+        if isinstance(self.runner,ParallelRun):
+            self.runner.close()
         self.last_error=f'실행 시작 실패 · {error}'
         self.event('log',self.last_error)
         self.event('state','오류')
@@ -1433,7 +1682,13 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.paint(self.visible_parent[uid])
 
     def event(self,kind,value):
-        if kind=='run_started':
+        if kind in ('tab_event','single_tab_event'):
+            self.tab_run_event(*value)
+            if kind=='single_tab_event' and value[1]=='state':
+                self.run_status=value[2]
+        elif kind=='motion_samples':
+            self.review_motion(*value)
+        elif kind=='run_started':
             self.run_status='실행 중'
             if not self.runner.cancel.is_set():
                 self.pause_button.configure(state='normal')
@@ -1483,7 +1738,7 @@ class App(WorkflowEditor,TkinterDnD.Tk):
         elif kind=='image_iteration':
             uid,iteration=value
             self.set_state(uid,'running',f'{iteration}회째 반복 중')
-            self.log.append(f'{self.stage_numbers[uid]}단계 · {iteration}회째 반복 중')
+            self.event('log',f'{self.stage_numbers[uid]}단계 · {iteration}회째 반복 중')
         elif kind=='stop':
             self.stop(value or '창의 정지 버튼')
         elif kind=='record_row':
@@ -1494,7 +1749,10 @@ class App(WorkflowEditor,TkinterDnD.Tk):
                 del self.log[:500]
         elif kind=='active':
             self.last_wait_state=None
+            previous=self.visible_parent.get(self.current,self.current)
             self.current=value
+            if previous in self.rows and previous!=self.visible_parent.get(value,value):
+                self.paint(previous)
             s=self.locate(value)[2]
             detail='이미지 찾는 중' if s['kind'] in ('image','find','wait','condition') else '실행 중'
             self.set_state(value,'running',detail)
@@ -1510,6 +1768,8 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.last_completed_step=(time.strftime('%H:%M:%S'),self.stage_numbers[value],
                                       self.caption(self.locate(value)[2])[0])
             self.set_state(value,'done','✓ 완료')
+        elif kind=='step_skipped':
+            self.set_state(value,'stopped','동작 건너뜀')
         elif kind=='step_error':
             uid,error=value
             self.set_state(uid,'error','! 실패')
@@ -1533,6 +1793,9 @@ class App(WorkflowEditor,TkinterDnD.Tk):
             self.event('log',f'{self.cycle_caption}실행 종료 · {self.run_status}{detail}')
             self.last_runner=self.runner
             self.runner=None
+            for index,state in self.tab_status.items():
+                if state in ('감시 중','동작 중'):
+                    self.tab_status[index]=self.run_status
             self.update_capture_exclusion(False)
             if self.run_status=='정지됨' and self.current and self.states.get(self.current,('',''))[0] in ('running','paused'):
                 self.set_state(self.current,'stopped','■ 정지됨')
@@ -1560,6 +1823,10 @@ class App(WorkflowEditor,TkinterDnD.Tk):
 
     def show_frame(self):
         runner=self.runner or getattr(self,'last_runner',None)
+        if isinstance(runner,ParallelRun):
+            runner=runner.runners.get(self.active_tab)
+        elif getattr(runner,'tab_index',self.active_tab)!=self.active_tab:
+            runner=None
         frame=getattr(runner,'last_frame',None)
         if frame is None:
             messagebox.showinfo('읽은 화면','표시할 캡처 화면이 없습니다.',parent=self)

@@ -232,6 +232,10 @@ def quick_scaled_candidates(screen,model,scales,threshold,check):
                     score = min(limit,max(score,shape[0]))
             if score>=limit:
                 found.append((score,left,top,w,h))
+        # A strictly verified size is enough for this pass. Continue checking
+        # other positions at this size before returning to resolve duplicates.
+        if found and max(item[0] for item in found)>=.985:
+            break
     return found, limited
 
 
